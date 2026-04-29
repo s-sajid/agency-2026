@@ -4,9 +4,7 @@ import { useEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import {
   X,
-  FileText,
   AlertTriangle,
-  ArrowRight,
   ShieldCheck,
   Database,
   Hash,
@@ -547,23 +545,9 @@ export function NotificationDetailModal({
 
         {/* ── Footer ──────────────────────────────────────────────────── */}
         <div
-          className="pl-7 pr-5 py-3 border-t border-border flex items-center justify-between gap-3"
+          className="pl-7 pr-5 py-3 border-t border-border flex items-center justify-end"
           style={{ background: 'hsl(var(--muted) / 0.3)' }}
         >
-          <button
-            onClick={() => {
-              // Dummy — would deep-link into the chat with the source
-              // job's audit drawer expanded once we expose that route.
-              // For now: just close.
-              onClose()
-            }}
-            className="flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-[0.18em] text-muted-foreground hover:text-foreground transition-colors"
-            style={{ fontFamily: 'var(--font-syne)' }}
-          >
-            <FileText className="h-3 w-3" />
-            View source job audit
-            <ArrowRight className="h-3 w-3" />
-          </button>
           <button
             onClick={onClose}
             className="px-3 py-1.5 rounded text-[10.5px] font-bold uppercase tracking-[0.18em] bg-foreground text-background hover:opacity-85 transition-opacity"
