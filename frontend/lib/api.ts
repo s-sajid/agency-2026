@@ -244,3 +244,38 @@ export function fetchVendorCompetition() {
 export function fetchContractDistribution() {
   return getJson<import('./types').ContractDistributionBucket[]>('/dashboard/contract-distribution')
 }
+
+// ── Auto-scan notifications ───────────────────────────────────────────────────
+
+export interface NotificationHit {
+  metric: string
+  value: number
+  interpretation?: string
+  call_id?: string
+}
+
+export interface Notification {
+  notification_id: string
+  created_at: string
+  source_job_id: string
+  question: string
+  headline?: string
+  summary?: string
+  verdict?: 'MATCH' | 'PARTIAL' | 'DIVERGE' | 'INSUFFICIENT_DATA'
+  confidence?: 'high' | 'medium' | 'low'
+  sub_theme?: 'Efficiency' | 'Integrity' | 'Alignment'
+  hits: NotificationHit[]
+}
+
+export interface NotificationsResponse {
+  items: Notification[]
+  count: number
+}
+
+// Bypass the disk cache here — notifications are the one place a user
+// actively wants up-to-the-second freshness when the panel is open.
+export async function fetchNotifications(limit = 25): Promise<NotificationsResponse> {
+  const res = await fetch(`${BACKEND_URL}/notifications?limit=${limit}`, { cache: 'no-store' })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json() as Promise<NotificationsResponse>
+}
