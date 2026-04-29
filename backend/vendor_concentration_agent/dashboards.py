@@ -15,7 +15,12 @@ or PG_DSN — both work, so existing .env files don't need changing.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import os
+import threading
+import time
+from typing import Any, Callable
 
 import polars as pl
 from dotenv import load_dotenv
@@ -36,6 +41,54 @@ _CX_URI = _URI if "sslmode" in _URI else _URI + "?sslmode=require"
 
 def _query(sql: str) -> pl.DataFrame:
     return pl.read_database_uri(sql, _CX_URI)
+
+
+# ── In-process TTL cache for dashboard responses ──────────────────────────────
+#
+# Every chart endpoint runs heavy CTE queries against the Render Postgres
+# replica. The data updates daily at most, so caching for a few minutes is
+# safe. First request pays the latency; everything within TTL hits the
+# in-process dict in <1ms.
+#
+# Single-process model (one App Runner instance, default uvicorn worker
+# count). If you ever scale horizontally, each instance keeps its own
+# cache — minor inefficiency, not a correctness issue.
+_DASHBOARD_TTL_SECONDS = 300
+
+_cache: dict[Any, tuple[float, Any]] = {}
+_cache_lock = threading.Lock()
+
+
+def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
+    """Decorator: cache an async endpoint's return value for `ttl` seconds.
+
+    Cache key includes the function name and resolved arguments (defaults
+    applied), so `?limit=5` and `?limit=10` get separate entries while two
+    requests with the same `limit` share one. Errors are NOT cached —
+    Postgres failures retry on the next request.
+    """
+    def decorator(fn: Callable) -> Callable:
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            key = (fn.__name__, tuple(sorted(bound.arguments.items())))
+
+            now = time.time()
+            with _cache_lock:
+                hit = _cache.get(key)
+                if hit and (now - hit[0]) < ttl:
+                    return hit[1]
+
+            result = await fn(*args, **kwargs)
+            with _cache_lock:
+                _cache[key] = (now, result)
+            return result
+
+        return wrapper
+    return decorator
 
 
 # Ministry name normalization — maps known variant spellings to a single canonical name.
@@ -73,6 +126,7 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/metrics")
+@cached_dashboard()
 async def metrics():
     df = _query("""
         SELECT
@@ -91,6 +145,7 @@ async def metrics():
 
 
 @router.get("/top-vendors")
+@cached_dashboard()
 async def top_vendors(limit: int = 10):
     df = _query(f"""
         WITH normed AS (
@@ -118,6 +173,7 @@ async def top_vendors(limit: int = 10):
 
 
 @router.get("/concentration")
+@cached_dashboard()
 async def concentration(limit: int = 5):
     try:
         df = _query(f"""
@@ -165,6 +221,7 @@ async def concentration(limit: int = 5):
 
 
 @router.get("/concentration-scatter")
+@cached_dashboard()
 async def concentration_scatter():
     try:
         df = _query(f"""
@@ -218,6 +275,7 @@ async def concentration_scatter():
 
 
 @router.get("/vendor-dominance")
+@cached_dashboard()
 async def vendor_dominance(limit: int = 12):
     try:
         df = _query(f"""
@@ -273,6 +331,7 @@ async def vendor_dominance(limit: int = 12):
 
 
 @router.get("/spend-by-year")
+@cached_dashboard()
 async def spend_by_year():
     try:
         df = _query("""
@@ -294,6 +353,7 @@ async def spend_by_year():
 
 
 @router.get("/concentration-trend")
+@cached_dashboard()
 async def concentration_trend():
     try:
         df = _query(f"""
@@ -356,6 +416,7 @@ async def concentration_trend():
 
 
 @router.get("/vendor-competition")
+@cached_dashboard()
 async def vendor_competition():
     try:
         df = _query(f"""
@@ -409,6 +470,7 @@ async def vendor_competition():
 
 
 @router.get("/contract-distribution")
+@cached_dashboard()
 async def contract_distribution():
     try:
         df = _query("""
