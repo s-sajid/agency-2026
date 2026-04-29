@@ -23,7 +23,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -59,6 +59,18 @@ app.add_middleware(
 )
 
 app.include_router(dashboards_router)
+
+
+# Browser cache layer for the homepage charts. Pairs with the in-process
+# TTL cache on each /dashboard/* route — server cache eats the Postgres
+# round-trip; browser cache eats the network round-trip on warm reloads.
+# 5 minutes matches the server-side TTL so the two layers expire together.
+@app.middleware("http")
+async def add_dashboard_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/dashboard/"):
+        response.headers.setdefault("Cache-Control", "public, max-age=300")
+    return response
 
 
 @app.get("/health")

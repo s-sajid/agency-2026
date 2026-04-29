@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchVendorDominance } from '@/lib/api'
 import type { VendorDominancePoint } from '@/lib/types'
@@ -103,12 +104,15 @@ export function VendorDominanceChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3 px-5 pt-5">
-        <CardTitle
-          className="text-sm font-bold text-foreground tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Top Vendor Dominance
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold text-foreground tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Top Vendor Dominance
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground mt-0.5">
           #1 vendor's share of ministry spend · top 12 ministries by total contract value · bar midpoint = 50%
         </p>

@@ -6,6 +6,7 @@ import {
   Tooltip, ReferenceLine, ReferenceArea, ResponsiveContainer,
 } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchConcentrationScatter } from '@/lib/api'
 import type { ConcentrationScatterPoint } from '@/lib/types'
@@ -213,12 +214,15 @@ export function ConcentrationScatterChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-2 px-5 pt-5">
-        <CardTitle
-          className="text-sm font-bold text-foreground tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Spend vs. Concentration
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold text-foreground tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Spend vs. Concentration
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground mt-0.5">
           Ministries ≥$5M spend · X: total spend · Y: HHI · dividers at median spend &amp; HHI 2500
         </p>

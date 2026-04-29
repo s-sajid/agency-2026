@@ -5,6 +5,7 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Cell } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { fetchTopVendors } from '@/lib/api'
 
 type Row = { recipient: string; contract_count: number; total_amount: number }
@@ -36,12 +37,15 @@ export function TopVendorsChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3">
-        <CardTitle
-          className="text-sm font-bold tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Top Vendors by Contract Value
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Top Vendors by Contract Value
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground uppercase tracking-widest mt-0.5">
           Top 10 recipients · total contract value
         </p>

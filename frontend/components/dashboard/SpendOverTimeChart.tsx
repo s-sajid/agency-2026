@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchSpendByYear } from '@/lib/api'
@@ -29,12 +30,15 @@ export function SpendOverTimeChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3">
-        <CardTitle
-          className="text-sm font-bold tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Total Spend by Fiscal Year
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Total Spend by Fiscal Year
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground uppercase tracking-widest mt-0.5">
           Annual contract value · Alberta government
         </p>

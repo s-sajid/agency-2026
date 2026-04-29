@@ -197,8 +197,12 @@ export async function* streamChatEvents(query: string, context = ''): AsyncGener
 
 // ── dashboards (formerly proxied through Next.js /api/* — now direct) ─────────
 
+// Default fetch caching — browser respects the backend's `Cache-Control:
+// public, max-age=300` so warm reloads serve from the disk cache instead
+// of hitting the network. Server-side TTL cache + browser cache both
+// expire on a 5-minute clock so they stay in sync.
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${BACKEND_URL}${path}`, { cache: 'no-store' })
+  const res = await fetch(`${BACKEND_URL}${path}`)
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return res.json() as Promise<T>
 }

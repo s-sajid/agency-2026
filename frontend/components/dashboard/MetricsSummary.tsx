@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { fetchMetrics } from '@/lib/api'
 import type { DashboardMetrics, Stat } from '@/lib/types'
 
@@ -44,8 +45,11 @@ export function MetricsSummary() {
           {/* Red left border — government document field marker */}
           <div className="absolute top-0 left-0 bottom-0 w-[4px] bg-primary" />
           <CardContent className="pt-5 pb-5 pl-7 pr-5">
-            <div className="text-[11px] font-medium text-muted-foreground uppercase tracking-widest mb-3">
-              {stat?.label ?? <Skeleton className="h-3 w-24" />}
+            <div className="flex items-start justify-between gap-2 mb-3">
+              <div className="text-[11px] font-medium text-muted-foreground uppercase tracking-widest">
+                {stat?.label ?? <Skeleton className="h-3 w-24" />}
+              </div>
+              <SourceBadge />
             </div>
             {stat ? (
               <p

@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { ChartContainer, ChartTooltip } from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchVendorCompetition } from '@/lib/api'
@@ -30,12 +31,15 @@ export function VendorCompetitionChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3">
-        <CardTitle
-          className="text-sm font-bold tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          New vs. Incumbent Vendor Spend
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            New vs. Incumbent Vendor Spend
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground uppercase tracking-widest mt-0.5">
           Annual contract value · new entrants vs. returning suppliers
         </p>
