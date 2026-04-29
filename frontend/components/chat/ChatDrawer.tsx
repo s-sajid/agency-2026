@@ -3,7 +3,6 @@
 import { useRef, useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
-import { Skeleton } from '@/components/ui/skeleton'
 import { pollChat, type ToolResult } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import {
@@ -129,7 +128,7 @@ function useElapsedTime(active: boolean): number {
 }
 
 function AgentCard({
-  icon, color, label, role, sublabel, state, badge,
+  icon, color, label, role, sublabel, state, badge, question, onPath = true,
 }: {
   icon: React.ReactNode
   color: string
@@ -138,81 +137,317 @@ function AgentCard({
   sublabel?: string
   state: NodeState
   badge?: string
+  // The live tool-call question for this agent — surfaced inside the
+  // spotlight card so the user can see *what* the running agent is being
+  // asked to do, not just that it's running.
+  question?: string
+  // Whether this agent is on the active route's path. When false (and a
+  // route has been chosen), the card renders deeply faded so the user
+  // can still see the architecture but the active path reads first.
+  onPath?: boolean
 }) {
-  const elapsed = useElapsedTime(state === 'active')
-  return (
-    <div className={cn(
-      'relative rounded-md border overflow-hidden transition-all duration-500',
-      state === 'idle' && 'border-border/15 opacity-40',
-      state === 'active' && 'border-border/50',
-      state === 'done' && 'border-border/35',
-    )}>
-      <div
-        className="absolute left-0 top-0 bottom-0 w-[3px] transition-all duration-500"
-        style={{
-          backgroundColor:
-            state === 'done' ? 'hsl(var(--chart-3))' :
-            state === 'active' ? color : 'transparent',
-        }}
-      />
-      <div className="pl-3.5 pr-2.5 py-2">
-        <div className="flex items-center justify-between mb-1">
-          <span
-            className="text-[8px] font-bold uppercase tracking-[0.12em] transition-colors duration-300"
-            style={{
-              color:
-                state === 'active' ? color :
-                state === 'done' ? 'hsl(var(--chart-3))' :
-                'hsl(var(--muted-foreground) / 0.3)',
-            }}
-          >{role}</span>
-          <div className="flex items-center gap-1">
-            {state === 'active' && elapsed > 0 && (
-              <span className="text-[9px] font-mono tabular-nums text-muted-foreground/45">
-                {elapsed}s
-              </span>
-            )}
-            {state === 'active' && <Loader2 className="h-2.5 w-2.5 text-primary animate-spin" />}
-            {state === 'done' && (
-              <CheckCircle2 className="h-2.5 w-2.5" style={{ color: 'hsl(var(--chart-3))' }} />
-            )}
-            {state === 'idle' && <div className="h-1.5 w-1.5 rounded-full bg-border/25" />}
-          </div>
+  const elapsed = useElapsedTime(state === 'active' && onPath)
+
+  // Off-path: very faded compact strip — never spotlight even if "active"
+  // because the backend isn't actually running this agent on this route.
+  if (!onPath) {
+    return (
+      <div className="relative rounded border border-border/10 overflow-hidden opacity-[0.18] transition-opacity duration-500">
+        <div className="pl-3 pr-2.5 py-1.5 flex items-center gap-2">
+          <span className="shrink-0 flex items-center justify-center w-3.5 h-3.5 text-muted-foreground/50">
+            {icon}
+          </span>
+          <span className="text-[11.5px] font-semibold tracking-tight flex-1 truncate text-muted-foreground/60">
+            {label}
+          </span>
+          <span className="text-[7.5px] font-bold uppercase tracking-[0.12em] text-muted-foreground/40 shrink-0">
+            bypass
+          </span>
         </div>
-        <div className="flex items-center gap-1.5">
-          <span
-            className="shrink-0 transition-colors duration-300"
-            style={{ color: state === 'idle' ? 'hsl(var(--muted-foreground) / 0.3)' : color }}
-          >{icon}</span>
-          <span className={cn(
-            'text-[12px] font-semibold tracking-tight transition-colors duration-300',
-            state === 'idle' && 'text-muted-foreground/30',
-            state === 'active' && 'text-foreground',
-            state === 'done' && 'text-muted-foreground/70',
-          )}>{label}</span>
-          {badge && state !== 'idle' && (
-            <span className="text-[8px] font-medium text-muted-foreground/50 bg-muted border border-border/40 rounded px-1 py-0.5 leading-none">
-              {badge}
-            </span>
-          )}
-        </div>
-        {sublabel && state !== 'idle' && (
-          <p className={cn(
-            'text-[10px] mt-1.5 pl-[22px] leading-snug break-words line-clamp-2 transition-colors duration-300',
-            state === 'active' ? 'text-muted-foreground' : 'text-muted-foreground/40',
-          )}>{sublabel}</p>
-        )}
       </div>
-      {state === 'active' && (
-        <div className="absolute bottom-0 left-0 right-0 h-[2px] overflow-hidden">
+    )
+  }
+
+  // ── Spotlight: the agent currently running ──────────────────────────────
+  if (state === 'active') {
+    return (
+      <div
+        className="relative rounded-lg border-2 overflow-hidden transition-all duration-500"
+        style={{
+          borderColor: color,
+          boxShadow: `0 0 0 4px color-mix(in srgb, ${color} 12%, transparent), 0 12px 36px color-mix(in srgb, ${color} 22%, transparent)`,
+        }}
+      >
+        {/* Color wash */}
+        <div className="absolute inset-0 pointer-events-none" style={{ background: color, opacity: 0.07 }} />
+        {/* Top scan-bar — thicker than the old version */}
+        <div className="absolute top-0 left-0 right-0 h-[3px] overflow-hidden">
           <div
             className="absolute top-0 bottom-0 w-2/5 pipeline-scan"
             style={{ background: `linear-gradient(90deg, transparent 0%, ${color} 50%, transparent 100%)` }}
           />
         </div>
-      )}
+
+        <div className="relative px-4 pt-4 pb-3.5">
+          <div className="flex items-center justify-between mb-2.5">
+            <span
+              className="text-[9px] font-bold uppercase tracking-[0.18em]"
+              style={{ color }}
+            >
+              {role} · running
+            </span>
+            <div className="flex items-center gap-1.5">
+              {elapsed > 0 && (
+                <span className="text-[10px] font-mono tabular-nums" style={{ color }}>
+                  {elapsed}s
+                </span>
+              )}
+              <Loader2 className="h-3 w-3 animate-spin" style={{ color }} />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {/* Radar pulse + saturated icon disc */}
+            <div className="relative shrink-0">
+              <span
+                className="absolute inset-0 rounded-full radar-pulse"
+                style={{ background: color }}
+              />
+              <span
+                className="absolute inset-0 rounded-full radar-pulse-2"
+                style={{ background: color }}
+              />
+              <div
+                className="relative h-10 w-10 rounded-full flex items-center justify-center text-white"
+                style={{ background: color, boxShadow: `0 0 24px color-mix(in srgb, ${color} 55%, transparent)` }}
+              >
+                <span className="scale-150">{icon}</span>
+              </div>
+            </div>
+            <div className="min-w-0 flex-1">
+              <h4
+                className="text-[15px] font-bold tracking-tight leading-tight text-foreground"
+                style={{ fontFamily: 'var(--font-syne)' }}
+              >
+                {label}
+              </h4>
+              {sublabel && (
+                <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                  {sublabel}
+                </p>
+              )}
+            </div>
+            {badge && (
+              <span
+                className="text-[9px] font-bold uppercase tracking-[0.12em] rounded px-1.5 py-1 leading-none shrink-0 text-white"
+                style={{ background: color }}
+              >
+                {badge}
+              </span>
+            )}
+          </div>
+
+          {question && (
+            <div
+              className="mt-3 pt-2.5 border-t"
+              style={{ borderColor: `color-mix(in srgb, ${color} 22%, transparent)` }}
+            >
+              <p className="text-[10px] uppercase tracking-[0.16em] font-semibold mb-1" style={{ color }}>
+                Task
+              </p>
+              <p className="text-[11.5px] text-foreground/85 leading-relaxed line-clamp-3">
+                {question}
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ── Compact: idle or done — recede so the spotlight reads ───────────────
+  return (
+    <div className={cn(
+      'relative rounded border overflow-hidden transition-all duration-500',
+      state === 'idle' && 'border-border/10 opacity-30',
+      state === 'done' && 'border-border/40',
+    )}>
+      <div
+        className="absolute left-0 top-0 bottom-0 w-[2px]"
+        style={{ backgroundColor: state === 'done' ? 'hsl(var(--chart-3))' : 'transparent' }}
+      />
+      <div className="pl-3 pr-2.5 py-1.5 flex items-center gap-2">
+        <span
+          className="shrink-0 flex items-center justify-center w-3.5 h-3.5"
+          style={{ color: state === 'idle' ? 'hsl(var(--muted-foreground) / 0.4)' : color }}
+        >
+          {icon}
+        </span>
+        <span className={cn(
+          'text-[11.5px] font-semibold tracking-tight flex-1 truncate',
+          state === 'idle' && 'text-muted-foreground/40',
+          state === 'done' && 'text-muted-foreground/85',
+        )}>
+          {label}
+        </span>
+        {badge && state === 'done' && (
+          <span className="text-[8px] font-medium text-muted-foreground/55 bg-muted border border-border/40 rounded px-1 py-0.5 leading-none shrink-0">
+            {badge}
+          </span>
+        )}
+        <span
+          className="text-[7.5px] font-bold uppercase tracking-[0.12em] shrink-0"
+          style={{
+            color: state === 'idle' ? 'hsl(var(--muted-foreground) / 0.3)' : 'hsl(var(--chart-3))',
+          }}
+        >
+          {state === 'idle' ? 'wait' : 'done'}
+        </span>
+        {state === 'done' && (
+          <CheckCircle2 className="h-2.5 w-2.5 shrink-0" style={{ color: 'hsl(var(--chart-3))' }} />
+        )}
+      </div>
     </div>
   )
+}
+
+// Vertical connector between two nodes in the topology. State is derived
+// from the *target* agent: if the target is running we animate flowing
+// dashes in its color; if it's done we render a solid coloured stem.
+function FlowConnector({
+  state,
+  color,
+  onPath = true,
+  variant = 'pipeline',
+}: {
+  state: NodeState
+  color: string
+  onPath?: boolean
+  // 'pipeline' is a vertical centreline; 'branch' is a curved side path
+  // used for the Router → Narrative alt route.
+  variant?: 'pipeline' | 'branch'
+}) {
+  if (variant === 'branch') {
+    return (
+      <div className="relative h-12 w-full pointer-events-none">
+        <svg viewBox="0 0 200 48" className="absolute inset-0 w-full h-full overflow-visible">
+          <path
+            d="M 100 0 C 100 22, 130 22, 160 30 L 180 36"
+            stroke={onPath ? color : 'hsl(var(--border))'}
+            strokeWidth={onPath ? 2 : 1}
+            strokeDasharray={onPath && state === 'active' ? '4 4' : undefined}
+            fill="none"
+            opacity={onPath ? 1 : 0.25}
+            className={onPath && state === 'active' ? 'flow-dash-svg' : undefined}
+          />
+          <polygon
+            points="180,32 188,36 180,40"
+            fill={onPath ? color : 'hsl(var(--border))'}
+            opacity={onPath ? 1 : 0.25}
+          />
+        </svg>
+        <span
+          className="absolute right-1 top-1 text-[7.5px] font-bold uppercase tracking-[0.18em]"
+          style={{ color: onPath ? color : 'hsl(var(--muted-foreground))', opacity: onPath ? 0.85 : 0.35 }}
+        >
+          alt path
+        </span>
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative h-7 w-full pointer-events-none flex justify-center">
+      {/* Stem */}
+      <div
+        className="absolute top-0 bottom-1.5 w-[2px] left-1/2 -translate-x-1/2 transition-opacity duration-300"
+        style={{
+          background: onPath
+            ? (state === 'idle' ? 'hsl(var(--border))' : color)
+            : 'hsl(var(--border))',
+          opacity: onPath ? (state === 'idle' ? 0.4 : 1) : 0.18,
+        }}
+      />
+      {/* Animated dash overlay when target agent is running */}
+      {onPath && state === 'active' && (
+        <div
+          className="absolute top-0 bottom-1.5 w-[2px] left-1/2 -translate-x-1/2 flow-dash"
+          style={{
+            background: `repeating-linear-gradient(180deg, ${color} 0 6px, transparent 6px 12px)`,
+          }}
+        />
+      )}
+      {/* Arrowhead */}
+      <div
+        className="absolute bottom-0 left-1/2 -translate-x-1/2 w-0 h-0"
+        style={{
+          borderLeft: '5px solid transparent',
+          borderRight: '5px solid transparent',
+          borderTop: `7px solid ${onPath ? (state === 'idle' ? 'hsl(var(--border))' : color) : 'hsl(var(--border))'}`,
+          opacity: onPath ? (state === 'idle' ? 0.55 : 1) : 0.25,
+        }}
+      />
+    </div>
+  )
+}
+
+// Deterministic Final Brief terminator — no LLM, so it gets a different
+// visual tier than the agent cards. Only rendered for the pipeline route.
+function FinalBriefNode({ state }: { state: NodeState }) {
+  return (
+    <div
+      className={cn(
+        'relative rounded-lg border-2 border-dashed overflow-hidden transition-all duration-500',
+        state === 'idle' && 'opacity-30',
+      )}
+      style={{
+        borderColor: state === 'done'
+          ? 'hsl(var(--chart-3))'
+          : state === 'active'
+            ? 'hsl(var(--chart-5))'
+            : 'hsl(var(--border))',
+      }}
+    >
+      <div className="px-3.5 py-2.5 flex items-center gap-2.5">
+        <div
+          className="h-7 w-7 rounded-md flex items-center justify-center shrink-0 text-white"
+          style={{
+            background: state === 'done' ? 'hsl(var(--chart-3))' : 'hsl(var(--chart-5))',
+          }}
+        >
+          <CheckCircle2 className="h-3.5 w-3.5" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p
+            className="text-[12px] font-bold tracking-tight leading-none"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Final Brief
+          </p>
+        </div>
+        <span
+          className="text-[7.5px] font-bold uppercase tracking-[0.12em] shrink-0"
+          style={{
+            color: state === 'done' ? 'hsl(var(--chart-3))' : 'hsl(var(--muted-foreground))',
+          }}
+        >
+          {state === 'done' ? 'ready' : state === 'active' ? 'composing' : 'pending'}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// Which agents are on the path for a given route? Used to fade off-path
+// nodes + grey out the connectors that don't carry traffic.
+function isOnPath(agent: string, route?: string): boolean {
+  if (!route) return true // before classification, the whole graph is live
+  if (route === 'pipeline') return ['discovery', 'investigation', 'validator'].includes(agent)
+  if (route === 'narration') return agent === 'narrative'
+  if (route === 'discovery') return agent === 'discovery'
+  if (route === 'investigation') return agent === 'investigation'
+  if (route === 'validation') return agent === 'validator'
+  return false // out_of_scope or unknown
 }
 
 function PipelinePanel({
@@ -244,8 +479,30 @@ function PipelinePanel({
     return calls.every((t) => t.done) ? 'done' : 'active'
   }
 
+  function questionFor(name: string): string | undefined {
+    // Prefer the most recent in-flight call; fall back to the last call we saw.
+    const calls = toolCalls.filter((t) => t.name === name)
+    const inflight = [...calls].reverse().find((t) => !t.done)
+    return (inflight ?? calls[calls.length - 1])?.question
+  }
+
   const routerState = nodeStateFor('router')
   const doneCount = toolCalls.filter((t) => t.done).length
+
+  // Final Brief is implicit in the pipeline: ready once Validator finishes.
+  // Never "active" on its own (no LLM call) — it goes idle → done.
+  const finalBriefState: NodeState =
+    nodeStateFor('validator') === 'done' ? 'done' : 'idle'
+
+  const routeName = route?.route
+  const pipelineActive = !routeName || routeName === 'pipeline'
+
+  // Helper: state for the connector pointing AT a given agent. We look
+  // at the agent below; if it's running or done, the connector inherits
+  // that state so flow lights up in cascading fashion.
+  const connectorTo = (agent: string): NodeState => nodeStateFor(agent)
+  const colorOf = (agent: string): string =>
+    PIPELINE_NODES.find((n) => n.name === agent)?.color ?? 'hsl(var(--primary))'
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -259,6 +516,32 @@ function PipelinePanel({
           0%   { transform: scale(1);   opacity: 1; }
           50%  { transform: scale(1.6); opacity: 0.4; }
           100% { transform: scale(1);   opacity: 1; }
+        }
+        @keyframes radar-pulse {
+          0%   { transform: scale(1);   opacity: 0.55; }
+          100% { transform: scale(2.2); opacity: 0;    }
+        }
+        .radar-pulse   { animation: radar-pulse 1.6s ease-out infinite; }
+        .radar-pulse-2 { animation: radar-pulse 1.6s ease-out infinite; animation-delay: 0.8s; }
+        @keyframes flow-dash {
+          0%   { background-position: 0 0;  }
+          100% { background-position: 0 24px; }
+        }
+        .flow-dash { animation: flow-dash 1.2s linear infinite; }
+        @keyframes flow-dash-svg {
+          0%   { stroke-dashoffset: 0;   }
+          100% { stroke-dashoffset: -16; }
+        }
+        .flow-dash-svg { animation: flow-dash-svg 1.2s linear infinite; }
+        @keyframes input-shimmer {
+          0%   { background-position: -200% 0; }
+          100% { background-position: 200% 0;  }
+        }
+        .input-shimmer {
+          background: linear-gradient(90deg, transparent, currentColor 40%, transparent 80%);
+          background-size: 200% 100%;
+          animation: input-shimmer 2.4s linear infinite;
+          opacity: 0.18;
         }
       `}</style>
 
@@ -285,6 +568,7 @@ function PipelinePanel({
         )}
       </div>
 
+      {/* Router — entry point of the topology */}
       <AgentCard
         icon={<Zap className="h-3.5 w-3.5" />}
         color={routerState === 'done' ? 'hsl(var(--chart-3))' : 'hsl(var(--primary))'}
@@ -297,21 +581,99 @@ function PipelinePanel({
         }
         state={routerState}
         badge={route?.route}
+        question={questionFor('router')}
       />
 
-      <div className="ml-3 border-l-2 border-border/20 pl-3 flex flex-col gap-1.5 pt-0.5">
-        {PIPELINE_NODES.map((node) => (
-          <AgentCard
-            key={node.name}
-            icon={node.icon}
-            color={node.color}
-            label={node.label}
-            role="agent"
-            sublabel={node.sublabel}
-            state={nodeStateFor(node.name)}
+      {/* ── Pipeline subgraph: Discovery → Investigation → Validator → Final Brief ── */}
+      <FlowConnector
+        state={connectorTo('discovery')}
+        color={colorOf('discovery')}
+        onPath={isOnPath('discovery', routeName)}
+      />
+      <AgentCard
+        icon={PIPELINE_NODES[0].icon}
+        color={PIPELINE_NODES[0].color}
+        label={PIPELINE_NODES[0].label}
+        role="agent"
+        sublabel={PIPELINE_NODES[0].sublabel}
+        state={nodeStateFor('discovery')}
+        question={questionFor('discovery')}
+        onPath={isOnPath('discovery', routeName)}
+      />
+
+      <FlowConnector
+        state={connectorTo('investigation')}
+        color={colorOf('investigation')}
+        onPath={isOnPath('investigation', routeName)}
+      />
+      <AgentCard
+        icon={PIPELINE_NODES[1].icon}
+        color={PIPELINE_NODES[1].color}
+        label={PIPELINE_NODES[1].label}
+        role="agent"
+        sublabel={PIPELINE_NODES[1].sublabel}
+        state={nodeStateFor('investigation')}
+        question={questionFor('investigation')}
+        onPath={isOnPath('investigation', routeName)}
+      />
+
+      <FlowConnector
+        state={connectorTo('validator')}
+        color={colorOf('validator')}
+        onPath={isOnPath('validator', routeName)}
+      />
+      <AgentCard
+        icon={PIPELINE_NODES[2].icon}
+        color={PIPELINE_NODES[2].color}
+        label={PIPELINE_NODES[2].label}
+        role="agent"
+        sublabel={PIPELINE_NODES[2].sublabel}
+        state={nodeStateFor('validator')}
+        question={questionFor('validator')}
+        onPath={isOnPath('validator', routeName)}
+      />
+
+      {/* Final Brief terminator — only meaningful on the pipeline route */}
+      {pipelineActive && (
+        <>
+          <FlowConnector
+            state={finalBriefState}
+            color={'hsl(var(--chart-5))'}
+            onPath={routeName === 'pipeline'}
           />
-        ))}
+          <FinalBriefNode state={finalBriefState} />
+        </>
+      )}
+
+      {/* ── Alt path: Narrative branches off the Router ── */}
+      <div className="relative my-3">
+        <div className="absolute inset-x-0 top-1/2 h-[1px] bg-border/40" />
+        <div className="relative flex justify-center">
+          <span
+            className="bg-card/50 px-2 text-[8px] font-bold uppercase tracking-[0.18em] text-muted-foreground/60"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            alt route
+          </span>
+        </div>
       </div>
+
+      <FlowConnector
+        state={nodeStateFor('narrative')}
+        color={colorOf('narrative')}
+        onPath={isOnPath('narrative', routeName)}
+        variant="branch"
+      />
+      <AgentCard
+        icon={PIPELINE_NODES[3].icon}
+        color={PIPELINE_NODES[3].color}
+        label={PIPELINE_NODES[3].label}
+        role="agent"
+        sublabel={PIPELINE_NODES[3].sublabel}
+        state={nodeStateFor('narrative')}
+        question={questionFor('narrative')}
+        onPath={isOnPath('narrative', routeName)}
+      />
     </div>
   )
 }
@@ -339,15 +701,150 @@ function AssistantTextBlock({ value }: { value: string }) {
   )
 }
 
-function AssistantBlocks({ blocks, streaming }: { blocks: Block[]; streaming?: boolean }) {
-  // Empty + streaming = show a small skeleton
-  if (blocks.length === 0 && streaming) {
-    return (
-      <div className="flex flex-col gap-2">
-        <Skeleton className="h-3.5 w-4/5" />
-        <Skeleton className="h-3.5 w-3/5" />
+// Status sentence keyed to the running agent. Reads as a stream-of-work,
+// not a generic "thinking" — the user sees what the backend is actually
+// doing while the first card is still in flight.
+const AGENT_NARRATION: Record<string, string> = {
+  router: 'Routing your question',
+  discovery: 'Mapping high-concentration categories',
+  investigation: 'Computing HHI, CR-n, and Gini',
+  validator: 'Cross-checking against sibling tables',
+  narrative: 'Composing the brief',
+}
+
+function spotlightFor(activeAgent: string[] | null | undefined):
+  { name: string; label: string; color: string } | null {
+  const name = activeAgent?.[0]
+  if (!name) return null
+  if (name === 'router') return { name, label: 'Router', color: 'hsl(var(--primary))' }
+  const node = PIPELINE_NODES.find((n) => n.name === name)
+  return node
+    ? { name, label: node.label, color: node.color }
+    : { name, label: name, color: 'hsl(var(--primary))' }
+}
+
+// Empty assistant bubble while the agents are working. The whole subtree
+// is keyed on `spot.name` so every agent transition triggers a fresh
+// word-rise + pen-stroke reveal — each pipeline phase gets its own
+// small narrative beat.
+function ThinkingBlock({
+  activeAgent,
+}: {
+  activeAgent?: string[] | null
+}) {
+  const spot = spotlightFor(activeAgent)
+  const status = (spot && AGENT_NARRATION[spot.name]) ?? 'Thinking'
+  const color = spot?.color ?? 'hsl(var(--primary))'
+  const words = status.split(' ')
+
+  return (
+    <div className="relative" key={`${spot?.name ?? 'idle'}-${status}`}>
+      <style>{`
+        @keyframes word-rise {
+          0%   { opacity: 0; transform: translateY(8px); filter: blur(4px); }
+          100% { opacity: 1; transform: translateY(0);   filter: blur(0); }
+        }
+        .word-rise {
+          opacity: 0;
+          animation: word-rise 460ms cubic-bezier(0.22,1,0.36,1) forwards;
+        }
+        @keyframes cursor-blink {
+          0%, 49%   { opacity: 1; }
+          50%, 100% { opacity: 0; }
+        }
+        .cursor-blink { animation: cursor-blink 0.85s step-end infinite; }
+        @keyframes pen-stroke {
+          0%   { transform: scaleX(0); }
+          100% { transform: scaleX(1); }
+        }
+        .pen-stroke {
+          transform-origin: left center;
+          animation: pen-stroke 800ms cubic-bezier(0.22,1,0.36,1) forwards;
+        }
+        @keyframes freq-bar {
+          0%, 100% { transform: scaleY(0.28); opacity: 0.45; }
+          50%      { transform: scaleY(1);    opacity: 1;    }
+        }
+        .freq-bar {
+          transform-origin: bottom center;
+          animation: freq-bar 1.05s ease-in-out infinite;
+        }
+      `}</style>
+
+      {/* Status line — word-by-word reveal in the display font */}
+      <p
+        className="text-[14px] font-semibold tracking-tight leading-snug text-foreground/90 flex flex-wrap items-baseline"
+        style={{ fontFamily: 'var(--font-syne)' }}
+      >
+        {words.map((w, i) => (
+          <span
+            key={i}
+            className="word-rise inline-block whitespace-pre"
+            style={{ animationDelay: `${i * 70}ms` }}
+          >
+            {w}
+            {i < words.length - 1 && ' '}
+          </span>
+        ))}
+        {/* Block cursor in the agent color */}
+        <span
+          className="cursor-blink inline-block ml-1 h-[14px] w-[8px] align-baseline translate-y-[2px]"
+          style={{
+            background: color,
+            animationDelay: `${words.length * 70 + 80}ms`,
+          }}
+        />
+      </p>
+
+      {/* Pen-stroke underline in the agent color — draws in after words land */}
+      <div className="relative mt-2 h-[1.5px] overflow-hidden rounded-full">
+        <div
+          className="absolute inset-0 pen-stroke"
+          style={{
+            background: `linear-gradient(90deg, transparent, ${color} 40%, ${color} 60%, transparent)`,
+            animationDelay: `${words.length * 70 + 200}ms`,
+          }}
+        />
       </div>
-    )
+
+      {/* Frequency visualiser + agent label */}
+      <div className="flex items-end gap-[3px] mt-3 h-[14px]">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <span
+            key={i}
+            className="freq-bar block w-[3px] h-full rounded-full"
+            style={{
+              background: color,
+              animationDelay: `${i * 110}ms`,
+            }}
+          />
+        ))}
+        {spot && (
+          <span
+            className="ml-2.5 text-[10px] font-bold uppercase tracking-[0.18em]"
+            style={{ color, fontFamily: 'var(--font-syne)' }}
+          >
+            {spot.label}
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function AssistantBlocks({
+  blocks,
+  streaming,
+  activeAgent,
+}: {
+  blocks: Block[]
+  streaming?: boolean
+  activeAgent?: string[] | null
+}) {
+  // Empty + streaming = the agents are working but no card has arrived
+  // yet. Show the narration block, not a static skeleton.
+  if (blocks.length === 0 && streaming) {
+    return <ThinkingBlock activeAgent={activeAgent} />
   }
   return (
     <>
@@ -536,6 +1033,9 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
   const activeAgent = lastAssistant?.activeAgent ?? null
   const pollTick = lastAssistant?.pollTick
 
+  // What's the spotlight agent right now? Used to label the input scrim.
+  const spotlight = spotlightFor(activeAgent)
+
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6" role="dialog" aria-modal="true">
       <div className="absolute inset-0 bg-background/75 backdrop-blur-md" onClick={() => onOpenChange(false)} />
@@ -612,15 +1112,19 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
                   </div>
                 ) : (
                   <div className="w-full max-w-[95%] rounded-2xl rounded-bl-sm px-4 py-3 bg-muted text-foreground">
-                    <AssistantBlocks blocks={msg.blocks} streaming={msg.streaming} />
+                    <AssistantBlocks
+                      blocks={msg.blocks}
+                      streaming={msg.streaming}
+                      activeAgent={msg.activeAgent}
+                    />
                   </div>
                 )}
               </div>
             ))}
           </div>
 
-          {/* Right: trace panel */}
-          <div className="w-[320px] shrink-0 border-l border-border bg-card/50 overflow-y-auto px-4 py-5">
+          {/* Right: trace panel — wider so the spotlight card breathes */}
+          <div className="w-[400px] shrink-0 border-l border-border bg-card/50 overflow-y-auto px-5 py-5">
             <PipelinePanel
               toolCalls={pipelineTools}
               streaming={isStreaming}
@@ -633,25 +1137,53 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
           </div>
         </div>
 
-        {/* Input */}
-        <form onSubmit={handleSubmit} className="px-4 py-3.5 border-t border-border shrink-0 bg-card">
-          <div className="flex items-center gap-2 bg-muted rounded-xl px-3.5 py-2.5 focus-within:ring-2 focus-within:ring-primary/30 transition-all">
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask about vendor concentration…"
-              disabled={loading}
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground disabled:opacity-50"
-            />
-            <button
-              type="submit"
-              disabled={loading || !input.trim()}
-              className="h-7 w-7 rounded-lg bg-primary flex items-center justify-center shrink-0 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors"
-            ><ArrowUp className="h-3.5 w-3.5 text-primary-foreground" /></button>
-          </div>
-        </form>
+        {/* Input — when loading, the field dims and the submit button swaps
+            to a spinner. The "what's running" signal lives in the right
+            panel, so the input doesn't repeat it. */}
+        <div className="relative shrink-0">
+          <form onSubmit={handleSubmit} className="relative px-4 py-3.5 border-t border-border bg-card">
+            <div
+              className={cn(
+                'relative flex items-center gap-2 bg-muted rounded-xl px-3.5 py-2.5 transition-all duration-300',
+                loading
+                  ? 'opacity-40 cursor-not-allowed'
+                  : 'focus-within:ring-2 focus-within:ring-primary/30',
+              )}
+            >
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={loading ? 'Waiting for the agent to finish…' : 'Ask about vendor concentration…'}
+                disabled={loading}
+                className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
+              />
+              <button
+                type="submit"
+                disabled={loading || !input.trim()}
+                className="h-7 w-7 rounded-lg bg-primary flex items-center justify-center shrink-0 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors"
+              >
+                {loading ? (
+                  <Loader2 className="h-3.5 w-3.5 text-primary-foreground animate-spin" />
+                ) : (
+                  <ArrowUp className="h-3.5 w-3.5 text-primary-foreground" />
+                )}
+              </button>
+            </div>
+
+            {/* Bottom-edge shimmer in the active agent's color — a subtle
+                'work happening' bar that reads even with the scrim. */}
+            {loading && (
+              <div className="absolute bottom-0 left-0 right-0 h-[2px] overflow-hidden">
+                <div
+                  className="absolute inset-0 input-shimmer"
+                  style={{ color: spotlight?.color ?? 'hsl(var(--primary))' }}
+                />
+              </div>
+            )}
+          </form>
+        </div>
       </div>
     </div>,
     document.body
