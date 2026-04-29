@@ -314,11 +314,23 @@ def _run_pipeline(job_id: str, question: str, context: str) -> dict:
         narrative_summary=narrative_summary,
     )
 
-    final_event = {
-        "kind": "tool_result",
-        "payload": {"tool_result": True, "kind": "final_brief", "data": brief},
-    }
-    _append_events(job_id, [final_event])
+    # Order in DDB events[] = render order in the chat:
+    # 1. The Final Brief card lands first.
+    # 2. The Narrative paraphrase reads as flowing prose below the cards.
+    #    It's the chat's only user-visible long-form text — internal
+    #    agents emit only structured cards.
+    events_to_append: list[dict] = [
+        {
+            "kind": "tool_result",
+            "payload": {"tool_result": True, "kind": "final_brief", "data": brief},
+        },
+    ]
+    if narrative_summary:
+        events_to_append.append({
+            "kind": "text",
+            "payload": {"text": narrative_summary},
+        })
+    _append_events(job_id, events_to_append)
     return {"final_brief": brief}
 
 

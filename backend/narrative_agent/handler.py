@@ -94,9 +94,23 @@ def handler(event, context):
             event.get("validator_parsed") or {},
         )
         logger.info("Narrative paraphrase: %s", question[:120])
-        return run_specialist(
+        result = run_specialist(
             "narrative", build_narrative_agent, user_input, "paraphrasing findings"
         )
+        # The generic runner emits a `tool_result` with kind="final_brief"
+        # (the Narrative agent's default card slot). In paraphrase mode that
+        # would render as a second, malformed Final Brief card alongside
+        # the orchestrator's real one. Strip it — the orchestrator will
+        # emit a plain text event with the paraphrase below the Final
+        # Brief card so the prose reads as flowing chat copy, not a card.
+        result["events"] = [
+            e for e in result.get("events", [])
+            if not (
+                e.get("kind") == "tool_result"
+                and (e.get("payload") or {}).get("kind") == "final_brief"
+            )
+        ]
+        return result
 
     # Default: standalone narration route
     extra_context = event.get("context", "")
