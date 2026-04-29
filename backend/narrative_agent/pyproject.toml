@@ -7,6 +7,11 @@ dependencies = [
     "boto3>=1.40",
     "python-dotenv>=1.0",
     "strands-agents>=1.37",
+    # Narrative doesn't query Postgres directly, but the shared
+    # vendor_concentration_agent package imports `data/postgres.py` whose
+    # top-level `import psycopg2` fires transitively. Without this the
+    # Lambda fails at import time with Runtime.ImportModuleError.
+    "psycopg2-binary>=2.9",
 ]
 
 [build-system]
