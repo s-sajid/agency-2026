@@ -210,10 +210,33 @@ def _run_pipeline(job_id: str, question: str, context: str) -> dict:
         "validator",
     )
 
+    # Narrative — paraphrase mode. Answers the user's question in plain
+    # English using ONLY values from the upstream structured outputs.
+    # If it fails or returns nothing usable we still ship the brief;
+    # build_final_brief falls back to its deterministic summary.
+    narrative_summary = ""
+    try:
+        narrative = _run_specialist(
+            job_id, NARRATIVE_FUNCTION,
+            {
+                "mode": "paraphrase",
+                "question": question,
+                "context": context,
+                "discovery_parsed": discovery.get("parsed") or {},
+                "investigation_parsed": investigation.get("parsed") or {},
+                "validator_parsed": validator.get("parsed") or {},
+            },
+            "narrative",
+        )
+        narrative_summary = str((narrative.get("parsed") or {}).get("summary") or "").strip()
+    except Exception as e:
+        logger.warning("Narrative paraphrase failed; falling back to deterministic summary: %s", e)
+
     brief = build_final_brief(
         discovery.get("parsed") or {},
         investigation.get("parsed") or {},
         validator.get("parsed") or {},
+        narrative_summary=narrative_summary,
     )
 
     final_event = {
