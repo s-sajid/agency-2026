@@ -1,0 +1,12 @@
+[project]
+name = "vendor-agent-scan-scheduler"
+version = "0.1.0"
+description = "Scheduled-scan Lambda — enqueues a high-HHI scan job every 10 minutes"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.40",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

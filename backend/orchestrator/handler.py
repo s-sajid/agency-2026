@@ -19,6 +19,9 @@ import json
 import logging
 import math
 import os
+import time
+import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -33,14 +36,20 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 JOBS_TABLE = os.environ["JOBS_TABLE"]
+NOTIFICATIONS_TABLE = os.environ.get("NOTIFICATIONS_TABLE", "")
 DISCOVERY_FUNCTION = os.environ["DISCOVERY_FUNCTION"]
 INVESTIGATION_FUNCTION = os.environ["INVESTIGATION_FUNCTION"]
 VALIDATOR_FUNCTION = os.environ["VALIDATOR_FUNCTION"]
 NARRATIVE_FUNCTION = os.environ["NARRATIVE_FUNCTION"]
 
+# An HHI above this DOJ threshold counts as "highly concentrated" and
+# triggers a notification when the run was a scheduled scan.
+HHI_HIGH_THRESHOLD = 2500.0
+
 dynamodb = boto3.resource("dynamodb")
 lambda_client = boto3.client("lambda")
 table = dynamodb.Table(JOBS_TABLE)
+notifications_table = dynamodb.Table(NOTIFICATIONS_TABLE) if NOTIFICATIONS_TABLE else None
 
 
 _OUT_OF_SCOPE = (
@@ -191,6 +200,72 @@ def _run_specialist(job_id: str, function_name: str, payload: dict, agent_label:
 
 # ── Dispatch ───────────────────────────────────────────────────────────────────
 
+# ── Notifications (scheduled scans only) ──────────────────────────────────────
+
+def _high_hhi_findings(brief: dict) -> list[dict]:
+    """Pick out HHI metrics in the Final Brief that exceed the DOJ
+    'highly concentrated' threshold. Returns a list of {metric, value,
+    interpretation, call_id} dicts — one per offending row.
+    """
+    hits: list[dict] = []
+    for m in (brief or {}).get("metrics_table") or []:
+        name = str(m.get("metric") or "").lower()
+        if "hhi" not in name:
+            continue
+        # metrics_table stores the formatted string ("3,142"); extract the
+        # raw number by stripping commas.
+        raw = str(m.get("value") or "").replace(",", "").strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if value > HHI_HIGH_THRESHOLD:
+            hits.append({
+                "metric": m.get("metric"),
+                "value": value,
+                "interpretation": m.get("interpretation"),
+                "call_id": m.get("call_id"),
+            })
+    return hits
+
+
+def _emit_notification(job_id: str, question: str, brief: dict, hits: list[dict]) -> None:
+    """Dummy notification sink for the hackathon — write a row into the
+    notifications DynamoDB table. The frontend (or `GET /notifications`)
+    can surface these. In production this would also publish to SNS / a
+    Slack webhook / email.
+    """
+    if notifications_table is None:
+        logger.info("NOTIFICATIONS_TABLE not configured — skipping notify")
+        return
+    notif_id = str(uuid.uuid4())
+    notifications_table.put_item(Item=_to_ddb({
+        "notification_id": notif_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_job_id": job_id,
+        "question": question,
+        "headline": brief.get("headline"),
+        "summary": brief.get("summary"),
+        "verdict": brief.get("verdict"),
+        "confidence": brief.get("confidence"),
+        "sub_theme": brief.get("sub_theme"),
+        "hits": hits,
+        "ttl": int(time.time()) + 7 * 86400,  # keep notifications for 7 days
+    }))
+    logger.info("Notification %s written for job %s (%d hit(s))",
+                notif_id, job_id, len(hits))
+
+
+def _maybe_notify(job_id: str, scheduled: bool, question: str, brief: dict) -> None:
+    if not scheduled or not brief:
+        return
+    hits = _high_hhi_findings(brief)
+    if not hits:
+        logger.info("Scheduled job %s found no high-HHI categories", job_id)
+        return
+    _emit_notification(job_id, question, brief, hits)
+
+
 def _run_pipeline(job_id: str, question: str, context: str) -> dict:
     discovery = _run_specialist(
         job_id, DISCOVERY_FUNCTION,
@@ -267,7 +342,8 @@ def handler(event, context):
         job_id = body["job_id"]
         message = body["message"]
         chat_context = body.get("context", "")
-        logger.info("Job %s starting: %s", job_id, message[:120])
+        scheduled = bool(body.get("scheduled", False))
+        logger.info("Job %s starting (scheduled=%s): %s", job_id, scheduled, message[:120])
 
         try:
             _set_status(job_id, "running", events=[], audit={}, active_agent=["router"])
@@ -287,6 +363,7 @@ def handler(event, context):
 
             if route == "pipeline":
                 result = _run_pipeline(job_id, message, chat_context)
+                _maybe_notify(job_id, scheduled, message, result.get("final_brief") or {})
             elif route in ("discovery", "investigation", "validation"):
                 result = _run_single(job_id, route, message, chat_context)
             elif route == "narration":
