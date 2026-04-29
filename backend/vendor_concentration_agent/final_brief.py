@@ -245,9 +245,22 @@ def _sanitize_verdict(verdict: dict) -> dict:
     return verdict
 
 
-def build_final_brief(plan: dict, findings: dict, verdict: dict) -> dict:
+def build_final_brief(
+    plan: dict,
+    findings: dict,
+    verdict: dict,
+    narrative_summary: str = "",
+) -> dict:
     """Compose the structured Final Brief payload that the frontend's
     FinalBriefCard renders.
+
+    `narrative_summary`, when provided, replaces the deterministic
+    summary string. The orchestrator passes the Narrative agent's
+    paraphrase here in pipeline mode — Narrative answers the user's
+    original question in plain English using ONLY values that appear in
+    the structured upstream outputs (enforced by the paraphrase prompt).
+    If the Narrative call fails or returns nothing usable, we fall back
+    to `_summary()` so the brief always has *some* summary.
     """
     plan = plan or {}
     findings = findings or {}
@@ -269,9 +282,11 @@ def build_final_brief(plan: dict, findings: dict, verdict: dict) -> dict:
     verdict_label = verdict.get("verdict")
     confidence = verdict.get("confidence")
 
+    summary = (narrative_summary or "").strip() or _summary(findings, verdict, plan)
+
     return {
         "headline": _headline(findings, verdict),
-        "summary": _summary(findings, verdict, plan),
+        "summary": summary,
         "metrics_table": metrics_table,
         "sub_theme": sub_theme,
         "verdict": verdict_label,
