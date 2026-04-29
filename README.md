@@ -24,9 +24,13 @@ flowchart LR
     Bedrock["Amazon Bedrock<br/>(openai.gpt-oss-120b)"]
     Sched["Smoke-test scheduler λ<br/>rate(5 min) → /health"]
     CW["CloudWatch<br/>vendor-agent/SmokeTest/Healthy"]
+    EB["EventBridge<br/>rate(10 min)"]
+    ScanSched["scan_scheduler λ<br/>enqueues a synthetic<br/>'find high-HHI categories' prompt"]
+    Notif[("DynamoDB<br/>vendor-agent-notifications<br/>(7-day TTL)")]
 
     Browser -- "POST /chat" --> AppRunner
     Browser -- "poll /status/:id every 1s" --> AppRunner
+    Browser -- "GET /notifications every 30s" --> AppRunner
     AppRunner -- "put job" --> DDB
     AppRunner -- "enqueue" --> SQS
     SQS --> Orch
@@ -43,10 +47,14 @@ flowchart LR
     Inv -. "math tools" .-> PG
     Val -. "math tools" .-> PG
     Orch -- "append events / audit / result" --> DDB
+    Orch -. "scheduled & HHI > 2500" .-> Notif
     AppRunner -- "GET /status, /audit" --> DDB
+    AppRunner -- "GET /notifications" --> Notif
     AppRunner -- "/dashboard/*" --> PG
     Sched --> AppRunner
     Sched -- "PutMetricData" --> CW
+    EB --> ScanSched
+    ScanSched -- "enqueue (scheduled=true)" --> SQS
 ```
 
 * **App Runner** — thin FastAPI service. `POST /chat` enqueues a job and
@@ -73,6 +81,18 @@ flowchart LR
 * **Smoke-test scheduler** — EventBridge schedule fires a Lambda every
   5 minutes. The Lambda pings `/health` and emits a CloudWatch metric
   (`vendor-agent/SmokeTest/Healthy`).
+* **Auto-scan scheduler** — separate EventBridge schedule fires the
+  `scan_scheduler` Lambda every 10 minutes. It enqueues a synthetic
+  *"find high-HHI categories"* prompt onto the same SQS queue as
+  user-facing chat, with `scheduled: true` on the message. The
+  orchestrator runs the same pipeline as a user question; if the
+  validated Final Brief contains any HHI metric over 2500 (the DOJ
+  *highly concentrated* threshold), the orchestrator writes a row to
+  the `vendor-agent-notifications` DynamoDB table. The frontend
+  navbar's bell icon polls `GET /notifications` every 30 seconds; a
+  click opens a "case dossier" modal with the headline, paraphrased
+  summary, hits, cross-checks, and recommended action. See
+  [Auto-scan & notifications](#auto-scan--notifications) below.
 
 ## Layout
 
@@ -89,7 +109,8 @@ agency-2026/
 │   ├── investigation_agent/handler.py
 │   ├── validator_agent/handler.py
 │   ├── narrative_agent/handler.py
-│   └── scheduler/handler.py            CloudWatch smoke-test
+│   ├── scheduler/handler.py            CloudWatch smoke-test (5-min)
+│   └── scan_scheduler/handler.py       auto-scan trigger (10-min)
 ├── frontend/                Next.js 16 app — `output: 'export'`, pnpm
 ├── references/              source-document registry (referenced by the validator)
 ├── terraform/               main.tf, variables.tf, terraform.tfvars.example
@@ -120,7 +141,9 @@ ROUTER ────────────────────────�
    │   (one LLM call, no tools)
    │
    ▼     ── pipeline route ──
-DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  FINAL BRIEF (deterministic, no LLM)
+DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  NARRATIVE  →  FINAL BRIEF
+                                              (paraphrase   (deterministic
+                                               only)         JSON template)
 ```
 
 - The **Router** runs inline inside the Orchestrator Lambda. The four
@@ -128,10 +151,23 @@ DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  FINAL BRIEF (deterministic, 
   synchronously by the orchestrator (`lambda:InvokeFunction`).
 - For the `pipeline` route the orchestrator runs Discovery →
   Investigation → Validator sequentially, threading each agent's
-  `raw_text` into the next as conversational context, then composes a
-  **Final Brief** deterministically from the three parsed JSON outputs.
+  `raw_text` into the next as conversational context. Once the
+  Validator's verdict lands, the orchestrator invokes Narrative in
+  **paraphrase mode** with the three structured outputs and the
+  user's original question; Narrative returns
+  `{"summary": "<2-3 sentences>"}` constrained to use only values
+  that already appear in the upstream JSON. The orchestrator then
+  composes a **Final Brief** by templating the structured outputs
+  deterministically and slotting Narrative's paraphrase in as the
+  brief's `summary` field. The orchestrator also appends the
+  paraphrase as a plain `text` event after the Final Brief card so
+  it reads as flowing prose at the bottom of the chat. If the
+  Narrative call fails, the brief falls back to a mechanical summary
+  so the pipeline still ships an answer.
 - For the `discovery`, `investigation`, `validation`, or `narration`
-  routes the orchestrator invokes only that one specialist.
+  routes the orchestrator invokes only that one specialist (Narrative
+  on the standalone `narration` route runs free-form, not in
+  paraphrase mode).
 
 ### Per-agent responsibilities & tools
 
@@ -141,7 +177,7 @@ DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  FINAL BRIEF (deterministic, 
 | **Discovery** | `discovery_agent` Lambda | Reframe the question into a measurable claim. Pick the dataset/category/dimension. Surface 3–5 candidate concentrated categories worth drilling into. Output: an investigation plan. | `list_top_concentrated_categories` |
 | **Investigation** | `investigation_agent` Lambda | Compute the actual numbers. For each candidate from Discovery, run concentration metrics and surface the dominant vendor, its share, and how long it has held the category. Every figure carries its `tool_call_id` so the audit drawer can show the SQL + source rows. | `hhi_for_category`, `cr_n_for_category`, `gini_for_category`, `sole_source_share`, `how_long_has_vendor_held_category`, `vendor_full_footprint`, `how_many_distinct_vendors_in_category` |
 | **Validator** | `validator_agent` Lambda | Cross-check Investigation's findings against a *second* source — sibling table (sole-source vs. competitive), cross-jurisdiction (AB ↔ FED ↔ open.canada.ca via `general.entity_match`), or finer-grained re-slice. Issue `MATCH` / `PARTIAL` / `DIVERGE` verdicts. Rule out by-design singletons (RCMP, Receiver General). | `cross_dataset_lookup_for_vendor`, `compare_two_computations`, `sole_source_share` *(deliberately NOT given the Investigation toolkit — letting Validator re-run HHI/CR_n with slightly different inputs would manufacture false DIVERGE verdicts)* |
-| **Narrative** | `narrative_agent` Lambda | Write the plain-English brief for a non-technical Minister. Surface the "huh, that's interesting" line. Tag every finding with its sub-theme (Efficiency / Integrity / Alignment). Cite every number back to a `tool_call_id`. | *None* — writing only |
+| **Narrative** | `narrative_agent` Lambda | Two modes. **Paraphrase mode** (pipeline route): given the user's question + Discovery / Investigation / Validator structured outputs, emit a 2–3 sentence summary that answers the question using only values already present in those outputs — no new numbers, names, percentages, or claims. **Narration mode** (standalone `narration` route): re-explain a prior finding in plain English when the user explicitly asks. | *None* — writing only |
 
 ### The math layer (the trust boundary)
 
@@ -207,12 +243,137 @@ card back from display:
 3. **Formula explainability** — every `formula_id` has a non-empty entry
    in `math/explainers.py`.
 
-### Final Brief (deterministic)
+### Final Brief (deterministic structure, LLM-paraphrased summary)
 
 `final_brief.py` composes the user-facing brief from the parsed
-structured outputs of Discovery + Investigation + Validator. No LLM is
-involved at this step, so it is impossible for the brief to introduce a
-number or claim that wasn't already in a sourced agent output.
+structured outputs of Discovery + Investigation + Validator. The
+brief's `headline`, `metrics_table`, `verdict`, `confidence`,
+`recommendation`, and `caveats` are templated by pure Python — no LLM
+involved at that step, so those fields can never carry a number or
+claim that wasn't already in a sourced agent output.
+
+The `summary` field is the one exception: it comes from Narrative's
+paraphrase pass, which is given the three structured outputs as JSON
+and instructed to use only values that appear verbatim there. If the
+paraphrase call fails for any reason, `final_brief.py` falls back to
+a mechanical sentence assembled from metric counts and the verdict —
+the brief always ships with *some* summary.
+
+## Auto-scan & notifications
+
+The same agent pipeline that answers user questions also runs
+proactively on a 10-minute cron, scanning for high-concentration
+categories without being asked.
+
+### Flow
+
+```
+EventBridge (rate(10 min))
+       │
+       ▼
+scan_scheduler λ
+       │  enqueues SQS message:
+       │    { "message": "Scan government spending and identify any
+       │                  category with an HHI above 2500 …",
+       │      "scheduled": true }
+       ▼
+orchestrator (same code path as user chat)
+       │  Router → Discovery → Investigation → Validator → Narrative → Final Brief
+       │
+       ▼
+_maybe_notify():
+  if scheduled AND brief.metrics_table contains an HHI metric > 2500:
+      write a row to vendor-agent-notifications DynamoDB
+       │
+       ▼
+GET /notifications  ←  navbar bell polls every 30s
+       │
+       ▼
+clicking a notification → "case dossier" modal with the headline,
+                          paraphrased summary, hits, cross-checks,
+                          and recommended action
+```
+
+The auto-scan reuses every part of the user pipeline — the Validator
+still gates on cross-checks, the Narrative still paraphrases, the
+Final Brief still composes deterministically. The only differences:
+
+- The triggering message is synthesised by the `scan_scheduler`
+  Lambda, not typed by a user.
+- The orchestrator inspects `scheduled: true` on the SQS message and
+  calls `_maybe_notify()` after the brief is composed.
+- Notifications are filtered to high-HHI hits *only* — a clean run
+  with no concentrations over the DOJ threshold writes nothing to
+  the table.
+
+### Notifications table
+
+Schema in `vendor-agent-notifications` DynamoDB:
+
+```json
+{
+  "notification_id": "<uuid>",
+  "created_at":      "<ISO 8601 UTC>",
+  "source_job_id":   "<orchestrator job ID; trace back to events/audit>",
+  "question":        "<the synthetic prompt that triggered the scan>",
+  "headline":        "<from final_brief>",
+  "summary":         "<from final_brief — Narrative paraphrase>",
+  "verdict":         "MATCH | PARTIAL | DIVERGE | INSUFFICIENT_DATA",
+  "confidence":      "high | medium | low",
+  "sub_theme":       "Efficiency | Integrity | Alignment",
+  "hits": [
+    { "metric": "HHI", "value": 4231, "interpretation": "highly concentrated", "call_id": "hhi-…" }
+  ],
+  "ttl": "<unix epoch + 7 days>"
+}
+```
+
+7-day TTL — DynamoDB will reap older rows automatically.
+
+### Frontend surfaces
+
+The navbar bell (`components/layout/NotificationsBell.tsx`):
+
+- Polls `GET /notifications` every 30 seconds.
+- Renders an unread badge with a pulse animation when any
+  notification's `created_at` is newer than the locally-stored
+  `last-seen` timestamp (`localStorage.agency2026.notifications.last-seen`).
+- Opens a portalled panel with a header that explains the pipeline
+  cadence and the trigger threshold, plus a list of recent
+  notifications (Syne headline, paraphrased summary, verdict pill,
+  sub-theme label, hit count, mono timestamp).
+- Empty state: *"Auto-scan is running. No high-concentration alerts
+  yet."*
+
+Clicking a row opens a **case dossier** modal
+(`components/layout/NotificationDetailModal.tsx`):
+
+- Verdict-coloured 5 px accent bar runs the full vertical edge of
+  the modal.
+- Hero header — sub-theme kicker, monospace dossier ID, Syne
+  headline, ISO timestamp · job ID · source-table metadata strip,
+  pills for verdict / confidence / hit count.
+- Sections divided by hairline rules with tracked-out Syne kicker
+  labels (`TRIGGER`, `SUMMARY`, `PRIMARY FINDING`, `CROSS-CHECKS`,
+  `RECOMMENDED ACTION`, `SIMILAR CATEGORIES ELSEWHERE`).
+- Primary finding card holds the headline HHI, a 4-column dossier
+  `<dl>` (dominant vendor, ministry, share %, tenure), and an inline
+  4-quarter SVG sparkline.
+- Some fields are still dummy enrichment for now (vendor / ministry
+  / sparkline / similar-categories list); they're keyed off the
+  notification ID so each row's dossier is deterministic.
+
+### Extending beyond the in-app bell
+
+The current `_emit_notification()` writes to DynamoDB; production
+deployments would typically fan out to one or more of:
+
+| Channel | How |
+|---|---|
+| Slack | `requests.post(SLACK_WEBHOOK_URL, json={...})` next to the DDB write |
+| Email / SMS | publish to an SNS topic with subscribers |
+| Browser push | `Notification.requestPermission()` in the bell + tie `new Notification(...)` to the poll loop |
+| Daily digest | a second scheduled Lambda that scans the table at 09:00 and composes a single email |
 
 ## Local development
 
