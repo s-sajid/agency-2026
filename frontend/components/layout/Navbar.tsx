@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { useTheme } from 'next-themes'
 import { MessageSquare, Sun, Moon } from 'lucide-react'
 import { ChatDrawer } from '@/components/chat/ChatDrawer'
+import { NotificationsBell } from '@/components/layout/NotificationsBell'
 
 export function Navbar() {
   const [chatOpen, setChatOpen] = useState(false)
@@ -57,6 +58,8 @@ export function Navbar() {
 
           {/* ── Right actions ── */}
           <div className="flex items-center gap-2">
+            <NotificationsBell />
+
             <button
               onClick={() => setTheme(isDark ? 'light' : 'dark')}
               className="h-8 w-8 rounded-md flex items-center justify-center transition-colors duration-150"
