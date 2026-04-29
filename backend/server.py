@@ -12,9 +12,11 @@ boring: write a job to DynamoDB, push to SQS, return.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from decimal import Decimal
@@ -87,12 +89,89 @@ class ChatResponse(BaseModel):
     job_id: str
 
 
+# ── In-process prompt cache ───────────────────────────────────────────────────
+#
+# Re-asking the same question (same `message` + same `context`) shouldn't burn
+# the entire pipeline again. We hash the prompt, remember the job_id we
+# created for it, and on a repeat hit we return the prior job_id — the
+# frontend polls /status/:id and immediately renders the cached result.
+#
+# The cache lives in App Runner process memory: lost on container restart,
+# not shared across instances. For our 1-instance hackathon footprint that's
+# fine; on a horizontal scale-out each instance just builds its own cache.
+
+_CHAT_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
+_CHAT_CACHE_MAX_ENTRIES = 256
+
+_chat_cache: dict[str, tuple[str, float]] = {}  # prompt_hash → (job_id, cached_at)
+_chat_cache_lock = threading.Lock()
+
+
+def _hash_prompt(message: str, context: str) -> str:
+    """Stable cache key. Lowercase + trim the message so trivial whitespace
+    or capitalization differences hit the same entry; keep `context` exact
+    because it's already a structured serialisation of prior turns."""
+    h = hashlib.sha256()
+    h.update(message.strip().lower().encode("utf-8"))
+    h.update(b"\n---\n")
+    h.update(context.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_lookup(prompt_hash: str) -> str | None:
+    """Return a cached job_id if (a) it's recent, (b) it still exists in
+    DynamoDB, and (c) it's in a terminal state (`complete` or `error`).
+    Otherwise return None and evict the stale entry."""
+    with _chat_cache_lock:
+        hit = _chat_cache.get(prompt_hash)
+    if not hit:
+        return None
+    cached_job_id, cached_at = hit
+    if (time.time() - cached_at) > _CHAT_CACHE_TTL_SECONDS:
+        with _chat_cache_lock:
+            _chat_cache.pop(prompt_hash, None)
+        return None
+    try:
+        item = table.get_item(Key={"job_id": cached_job_id}).get("Item")
+    except ClientError:
+        return None
+    status = (item or {}).get("status")
+    if status in ("complete", "error"):
+        return cached_job_id
+    if not item:
+        # The prior job TTL'd out of DDB — drop the cache entry.
+        with _chat_cache_lock:
+            _chat_cache.pop(prompt_hash, None)
+    # `pending` / `running` falls through and creates a new job; we don't
+    # coalesce in-flight requests because the orchestrator's idempotency
+    # surface (DDB writes keyed by job_id) doesn't promise that.
+    return None
+
+
+def _cache_store(prompt_hash: str, job_id: str) -> None:
+    with _chat_cache_lock:
+        # Cheap eviction: if we're at the cap, drop the oldest entry.
+        if len(_chat_cache) >= _CHAT_CACHE_MAX_ENTRIES:
+            oldest = min(_chat_cache.items(), key=lambda kv: kv[1][1])
+            _chat_cache.pop(oldest[0], None)
+        _chat_cache[prompt_hash] = (job_id, time.time())
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(body: ChatRequest) -> ChatResponse:
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     if not QUEUE_URL:
         raise HTTPException(status_code=500, detail="QUEUE_URL not configured")
+
+    prompt_hash = _hash_prompt(body.message, body.context)
+
+    # Re-asked? Reuse the prior job_id. Frontend polls /status/:id and gets
+    # the cached complete result instantly — no Bedrock, no SQS, no Lambda.
+    cached_job_id = _cache_lookup(prompt_hash)
+    if cached_job_id:
+        logger.info("Cache hit on prompt %s → job %s", prompt_hash, cached_job_id)
+        return ChatResponse(job_id=cached_job_id)
 
     job_id = str(uuid.uuid4())
     table.put_item(Item={
@@ -112,7 +191,8 @@ def chat(body: ChatRequest) -> ChatResponse:
             "context": body.context,
         }),
     )
-    logger.info("Enqueued job %s", job_id)
+    _cache_store(prompt_hash, job_id)
+    logger.info("Enqueued job %s (prompt %s)", job_id, prompt_hash)
     return ChatResponse(job_id=job_id)
 
 
