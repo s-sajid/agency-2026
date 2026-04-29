@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, ReferenceLine, Cell } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchConcentration } from '@/lib/api'
@@ -43,12 +44,15 @@ export function ConcentrationChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3">
-        <CardTitle
-          className="text-sm font-bold tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Concentration by Department
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Concentration by Department
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground uppercase tracking-widest mt-0.5">
           HHI score · top 10 departments
         </p>

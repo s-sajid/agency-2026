@@ -80,7 +80,7 @@ describe('fetchSpendByYear', () => {
       { year: 2021, total_spend: 1000000 },
       { year: 2022, total_spend: 2000000 },
     ])
-    expect(fetch).toHaveBeenCalledWith('/dashboard/spend-by-year', { cache: 'no-store' })
+    expect(fetch).toHaveBeenCalledWith('/dashboard/spend-by-year')
   })
 
   it('throws on non-ok response', async () => {

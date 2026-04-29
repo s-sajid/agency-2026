@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo } from 'react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ReferenceLine, Legend } from 'recharts'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SourceBadge } from '@/components/dashboard/SourceBadge'
 import { ChartContainer, ChartTooltip } from '@/components/ui/chart'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fetchConcentrationTrend } from '@/lib/api'
@@ -51,12 +52,15 @@ export function ConcentrationTrendChart() {
   return (
     <Card className="border-border">
       <CardHeader className="pb-3">
-        <CardTitle
-          className="text-sm font-bold tracking-tight"
-          style={{ fontFamily: 'var(--font-syne)' }}
-        >
-          Concentration Trend by Department
-        </CardTitle>
+        <div className="flex items-start justify-between gap-3">
+          <CardTitle
+            className="text-sm font-bold tracking-tight"
+            style={{ fontFamily: 'var(--font-syne)' }}
+          >
+            Concentration Trend by Department
+          </CardTitle>
+          <SourceBadge />
+        </div>
         <p className="text-[11px] text-muted-foreground uppercase tracking-widest mt-0.5">
           HHI over time · top 5 most concentrated departments
         </p>
