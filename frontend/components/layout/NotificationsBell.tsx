@@ -6,6 +6,7 @@ import { Bell, AlarmClock, Activity, X, ChevronRight } from 'lucide-react'
 
 import { fetchNotifications, type Notification } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { NotificationDetailModal } from '@/components/layout/NotificationDetailModal'
 
 const LAST_SEEN_KEY = 'agency2026.notifications.last-seen'
 const POLL_MS = 30_000
@@ -33,6 +34,7 @@ export function NotificationsBell() {
   const [open, setOpen] = useState(false)
   const [lastSeenAt, setLastSeenAt] = useState<string | null>(null)
   const [mounted, setMounted] = useState(false)
+  const [selected, setSelected] = useState<Notification | null>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
@@ -243,11 +245,14 @@ export function NotificationsBell() {
               const vColor = verdictColor(n.verdict)
               const hitCount = n.hits?.length ?? 0
               return (
-                <div
+                <button
                   key={n.notification_id}
-                  className={cn(
-                    'px-4 py-3 border-b border-border/50 last:border-b-0 hover:bg-muted/30 transition-colors',
-                  )}
+                  type="button"
+                  onClick={() => {
+                    setSelected(n)
+                    setOpen(false)
+                  }}
+                  className="w-full text-left px-4 py-3 border-b border-border/50 last:border-b-0 hover:bg-muted/40 focus:bg-muted/40 focus:outline-none transition-colors group"
                 >
                   <div className="flex items-start gap-2">
                     <span
@@ -259,7 +264,7 @@ export function NotificationsBell() {
                     />
                     <div className="min-w-0 flex-1">
                       <p
-                        className="text-[12px] font-bold tracking-tight leading-snug text-foreground line-clamp-2"
+                        className="text-[12px] font-bold tracking-tight leading-snug text-foreground line-clamp-2 group-hover:underline group-hover:underline-offset-[3px] decoration-foreground/20"
                         style={{ fontFamily: 'var(--font-syne)' }}
                       >
                         {n.headline || 'High-concentration finding'}
@@ -298,7 +303,7 @@ export function NotificationsBell() {
                       </div>
                     </div>
                   </div>
-                </div>
+                </button>
               )
             })}
           </div>
@@ -322,6 +327,14 @@ export function NotificationsBell() {
         </div>,
         document.body
       )}
+
+      {/* Detail dossier — opens when a row is clicked, closes via Esc /
+          backdrop / Close button. Renders alongside the bell so it
+          survives the bell panel closing. */}
+      <NotificationDetailModal
+        notification={selected}
+        onClose={() => setSelected(null)}
+      />
     </>
   )
 }
