@@ -442,7 +442,10 @@ function FinalBriefNode({ state }: { state: NodeState }) {
 // nodes + grey out the connectors that don't carry traffic.
 function isOnPath(agent: string, route?: string): boolean {
   if (!route) return true // before classification, the whole graph is live
-  if (route === 'pipeline') return ['discovery', 'investigation', 'validator'].includes(agent)
+  // Pipeline now ends with Narrative (paraphrase mode) before the
+  // deterministic Final Brief. So Narrative is on-path for both the
+  // pipeline route and the standalone narration route.
+  if (route === 'pipeline') return ['discovery', 'investigation', 'validator', 'narrative'].includes(agent)
   if (route === 'narration') return agent === 'narrative'
   if (route === 'discovery') return agent === 'discovery'
   if (route === 'investigation') return agent === 'investigation'
@@ -633,7 +636,27 @@ function PipelinePanel({
         onPath={isOnPath('validator', routeName)}
       />
 
-      {/* Final Brief terminator — only meaningful on the pipeline route */}
+      {/* Narrative — paraphrase step in the pipeline (between Validator
+          and Final Brief) and the sole specialist on the narration route. */}
+      <FlowConnector
+        state={nodeStateFor('narrative')}
+        color={colorOf('narrative')}
+        onPath={isOnPath('narrative', routeName)}
+      />
+      <AgentCard
+        icon={PIPELINE_NODES[3].icon}
+        color={PIPELINE_NODES[3].color}
+        label={PIPELINE_NODES[3].label}
+        role="agent"
+        sublabel={routeName === 'pipeline'
+          ? 'Paraphrase findings · no new claims'
+          : PIPELINE_NODES[3].sublabel}
+        state={nodeStateFor('narrative')}
+        question={questionFor('narrative')}
+        onPath={isOnPath('narrative', routeName)}
+      />
+
+      {/* Final Brief terminator — only on the pipeline route */}
       {pipelineActive && (
         <>
           <FlowConnector
@@ -644,36 +667,6 @@ function PipelinePanel({
           <FinalBriefNode state={finalBriefState} />
         </>
       )}
-
-      {/* ── Alt path: Narrative branches off the Router ── */}
-      <div className="relative my-3">
-        <div className="absolute inset-x-0 top-1/2 h-[1px] bg-border/40" />
-        <div className="relative flex justify-center">
-          <span
-            className="bg-card/50 px-2 text-[8px] font-bold uppercase tracking-[0.18em] text-muted-foreground/60"
-            style={{ fontFamily: 'var(--font-syne)' }}
-          >
-            alt route
-          </span>
-        </div>
-      </div>
-
-      <FlowConnector
-        state={nodeStateFor('narrative')}
-        color={colorOf('narrative')}
-        onPath={isOnPath('narrative', routeName)}
-        variant="branch"
-      />
-      <AgentCard
-        icon={PIPELINE_NODES[3].icon}
-        color={PIPELINE_NODES[3].color}
-        label={PIPELINE_NODES[3].label}
-        role="agent"
-        sublabel={PIPELINE_NODES[3].sublabel}
-        state={nodeStateFor('narrative')}
-        question={questionFor('narrative')}
-        onPath={isOnPath('narrative', routeName)}
-      />
     </div>
   )
 }
