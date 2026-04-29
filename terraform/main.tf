@@ -173,7 +173,7 @@ resource "aws_apprunner_service" "app" {
       access_role_arn = aws_iam_role.apprunner_ecr_access.arn
     }
 
-    auto_deployments_enabled = false
+    auto_deployments_enabled = true
   }
 
   instance_configuration {
