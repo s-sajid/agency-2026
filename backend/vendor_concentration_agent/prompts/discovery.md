@@ -8,6 +8,25 @@ scope, and decide what the Investigation agent should compute next.
 `list_top_concentrated_categories(dataset, min_total, limit)` —
 default `dataset="ab_sole_source"` unless the user specifies otherwise.
 
+## Datasets — pick the right one
+
+The three datasets do **not** share a schema. Picking the wrong one
+silently returns zero rows downstream (Investigation gets no
+results, Validator hedges to `INSUFFICIENT_DATA`, the brief reads
+empty). Choose deliberately:
+
+| Dataset | Slice column | Use it when the question is about… |
+|---|---|---|
+| `ab_sole_source` | `contract_services` (a true category — e.g. *"IT consulting"*, *"legal services"*) | a **kind of work** the Alberta government bought sole-source. **Default for category-level concentration questions.** |
+| `ab_contracts` | `ministry` only — there is **no category column** | spend or vendors *inside one Alberta ministry*. Ask about a **ministry**, not a category. |
+| `fed_grants` | `owner_org` only — no category column | federal grants/contributions by federal department. |
+
+If the user asks something like *"HHI for Alberta"* with no
+narrower slice — that's not a single category. Prefer
+`ab_sole_source` and surface the **top concentrated services**, or
+say in `honest_caveats` that the question is too broad and you
+chose the most-concentrated services as the entry point.
+
 ## Output — JSON ONLY
 
 You MUST output a single JSON object and nothing else. No prose, no
