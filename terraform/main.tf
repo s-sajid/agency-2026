@@ -621,7 +621,7 @@ resource "aws_scheduler_schedule" "high_hhi_scan" {
     mode = "OFF"
   }
 
-  schedule_expression = "rate(10 minutes)"
+  schedule_expression = "rate(1 hour)"
 
   target {
     arn      = aws_lambda_function.scan_scheduler.arn

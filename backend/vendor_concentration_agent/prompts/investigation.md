@@ -13,6 +13,28 @@ Discovery plan (or the user's direct question) and gather findings.
 - `vendor_full_footprint(vendor)` — distinct ministries × categories × $
 - `how_many_distinct_vendors_in_category(dataset, category)` — competition count
 
+## Datasets — `category` means different things in different tables
+
+The math tools take a `dataset` and a `category` argument, but the
+slice column is **not** the same across datasets:
+
+| Dataset | What `category` actually filters on |
+|---|---|
+| `ab_sole_source` | `contract_services` — true category (e.g. *"IT consulting"*) |
+| `ab_contracts` | `ministry` — pass a **ministry name**, not a service line |
+| `fed_grants` | `owner_org` — pass a **federal department**, not a service line |
+
+Mismatching these (e.g. asking `hhi_for_category(dataset="ab_contracts", category="IT consulting")`)
+will silently return zero rows because no row has that `ministry`
+value. If Discovery picked `ab_contracts` for a question that's
+ministry-shaped, your `category` argument must be a ministry name
+copied verbatim from Discovery's `candidates[*].category` (or from
+the user's question).
+
+If the tool returns zero rows, **prefer switching dataset over
+fabricating a value** — try `ab_sole_source` with the same intent
+and report what shifted in `interesting_moments`.
+
 ## Output — JSON ONLY
 
 Output a single JSON object. No prose, no fences.
