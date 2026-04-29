@@ -4,7 +4,7 @@ import { useRef, useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import { Skeleton } from '@/components/ui/skeleton'
-import { streamChatEvents, type ToolResult } from '@/lib/api'
+import { pollChat, type ToolResult } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import {
   ArrowUp, Sparkles, Compass, Calculator, ShieldCheck,
@@ -32,6 +32,10 @@ interface Message {
   streaming?: boolean
   toolCalls?: ToolCall[]
   route?: { route: string; reason: string }
+  // Authoritative "what's running on the backend right now" from the
+  // poll cycle — drives the right-side panel between event bursts.
+  activeAgent?: string[] | null
+  pollTick?: number
 }
 
 interface ChatDrawerProps {
@@ -212,23 +216,35 @@ function AgentCard({
 }
 
 function PipelinePanel({
-  toolCalls, streaming, empty, onSuggest, route,
+  toolCalls, streaming, empty, onSuggest, route, activeAgent, pollTick,
 }: {
   toolCalls: ToolCall[]
   streaming: boolean
   empty: boolean
   onSuggest: (s: string) => void
   route?: { route: string; reason: string }
+  // Authoritative "running right now" set from the poll cycle. Takes
+  // precedence over event-derived state because polling intervals can
+  // mean events lag the backend by up to ~1s.
+  activeAgent?: string[] | null
+  // Increments on every poll cycle — drives the small "tick" pulse in
+  // the header so the user can *see* polling is happening.
+  pollTick?: number
 }) {
   if (empty || (!streaming && toolCalls.length === 0)) {
     return <QuickStart onSuggest={onSuggest} />
   }
 
-  const routerCall = toolCalls.find((t) => t.name === 'router')
-  const routerState: NodeState =
-    !routerCall ? (streaming ? 'active' : 'idle') :
-    routerCall.done ? 'done' : 'active'
+  const activeSet = new Set(activeAgent ?? [])
 
+  function nodeStateFor(name: string): NodeState {
+    if (activeSet.has(name)) return 'active'
+    const calls = toolCalls.filter((t) => t.name === name)
+    if (calls.length === 0) return 'idle'
+    return calls.every((t) => t.done) ? 'done' : 'active'
+  }
+
+  const routerState = nodeStateFor('router')
   const doneCount = toolCalls.filter((t) => t.done).length
 
   return (
@@ -239,6 +255,11 @@ function PipelinePanel({
           to   { transform: translateX(500%); }
         }
         .pipeline-scan { animation: pipeline-scan 2s linear infinite; }
+        @keyframes poll-tick {
+          0%   { transform: scale(1);   opacity: 1; }
+          50%  { transform: scale(1.6); opacity: 0.4; }
+          100% { transform: scale(1);   opacity: 1; }
+        }
       `}</style>
 
       <div className="flex items-center justify-between mb-1.5">
@@ -253,9 +274,13 @@ function PipelinePanel({
           )}
         </div>
         {streaming && (
-          <span className="flex items-center gap-1 text-[9px] font-bold text-primary uppercase tracking-wider">
-            <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
-            Live
+          <span className="flex items-center gap-1.5 text-[9px] font-bold text-primary uppercase tracking-wider">
+            <span
+              key={pollTick}
+              className="h-1.5 w-1.5 rounded-full bg-primary"
+              style={{ animation: 'poll-tick 0.4s ease-out' }}
+            />
+            Polling
           </span>
         )}
       </div>
@@ -275,23 +300,17 @@ function PipelinePanel({
       />
 
       <div className="ml-3 border-l-2 border-border/20 pl-3 flex flex-col gap-1.5 pt-0.5">
-        {PIPELINE_NODES.map((node) => {
-          const calls = toolCalls.filter((t) => t.name === node.name)
-          const isActive = calls.some((t) => !t.done)
-          const isDone = calls.length > 0 && calls.every((t) => t.done)
-          const nodeState: NodeState = isActive ? 'active' : isDone ? 'done' : 'idle'
-          return (
-            <AgentCard
-              key={node.name}
-              icon={node.icon}
-              color={node.color}
-              label={node.label}
-              role="agent"
-              sublabel={node.sublabel}
-              state={nodeState}
-            />
-          )
-        })}
+        {PIPELINE_NODES.map((node) => (
+          <AgentCard
+            key={node.name}
+            icon={node.icon}
+            color={node.color}
+            label={node.label}
+            role="agent"
+            sublabel={node.sublabel}
+            state={nodeStateFor(node.name)}
+          />
+        ))}
       </div>
     </div>
   )
@@ -433,7 +452,21 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
     ])
 
     try {
-      for await (const event of streamChatEvents(query)) {
+      for await (const update of pollChat(query)) {
+        if (update.type === 'status') {
+          // Authoritative "what's running on the backend right now" —
+          // updated once per poll so the right panel doesn't lag the UI.
+          setMessages((prev) => {
+            const updated = [...prev]
+            const last = { ...updated[updated.length - 1] }
+            last.activeAgent = update.activeAgent
+            last.pollTick = (last.pollTick ?? 0) + 1
+            updated[updated.length - 1] = last
+            return updated
+          })
+          continue
+        }
+        const event = update.event
         if (event.type === 'text') {
           setMessages((prev) => appendTextToLast(prev, event.text))
         } else if (event.type === 'tool_result') {
@@ -500,14 +533,16 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
   const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
   const pipelineTools = lastAssistant?.toolCalls ?? []
   const isStreaming = lastAssistant?.streaming ?? false
+  const activeAgent = lastAssistant?.activeAgent ?? null
+  const pollTick = lastAssistant?.pollTick
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-8" role="dialog" aria-modal="true">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6" role="dialog" aria-modal="true">
       <div className="absolute inset-0 bg-background/75 backdrop-blur-md" onClick={() => onOpenChange(false)} />
 
       <div
-        className="relative z-10 w-full max-w-4xl flex flex-col bg-card border border-border rounded-2xl shadow-2xl overflow-hidden"
-        style={{ height: 'min(720px, 92vh)' }}
+        className="relative z-10 w-full max-w-6xl flex flex-col bg-card border border-border rounded-2xl shadow-2xl overflow-hidden"
+        style={{ height: 'min(880px, 95vh)' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -585,13 +620,15 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
           </div>
 
           {/* Right: trace panel */}
-          <div className="w-[260px] shrink-0 border-l border-border bg-card/50 overflow-y-auto px-4 py-5">
+          <div className="w-[320px] shrink-0 border-l border-border bg-card/50 overflow-y-auto px-4 py-5">
             <PipelinePanel
               toolCalls={pipelineTools}
               streaming={isStreaming}
               empty={messages.length === 0}
               onSuggest={(s) => { setInput(s); inputRef.current?.focus() }}
               route={lastAssistant?.route}
+              activeAgent={activeAgent}
+              pollTick={pollTick}
             />
           </div>
         </div>

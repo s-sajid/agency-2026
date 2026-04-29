@@ -150,7 +150,16 @@ async function fetchStatus(jobId: string): Promise<JobStatus> {
 
 const POLL_MS = 1000
 
-export async function* streamChatEvents(query: string, context = ''): AsyncGenerator<ChatEvent, void, unknown> {
+// A single tick in the polling cycle yields either a chat event extracted
+// from the appended events log, or a status update with the authoritative
+// `active_agent` field that the right-side panel uses to show what's
+// currently running on the backend (vs. the cumulative events log, which
+// only reflects what has *happened*).
+export type PollUpdate =
+  | { type: 'event'; event: ChatEvent }
+  | { type: 'status'; activeAgent: string[] | null; status: JobStatus['status'] }
+
+export async function* pollChat(query: string, context = ''): AsyncGenerator<PollUpdate, void, unknown> {
   const jobId = await createJob(query, context)
   let cursor = 0
 
@@ -164,15 +173,25 @@ export async function* streamChatEvents(query: string, context = ''): AsyncGener
           throw new Error(String((raw.payload as { error?: string }).error ?? 'agent error'))
         }
         const ev = rawToChatEvent(raw)
-        if (ev) yield ev
+        if (ev) yield { type: 'event', event: ev }
       }
       cursor = status.events.length
     }
+
+    yield { type: 'status', activeAgent: status.active_agent, status: status.status }
 
     if (status.status === 'error') throw new Error(status.error ?? 'job failed')
     if (status.status === 'complete') return
 
     await new Promise((r) => setTimeout(r, POLL_MS))
+  }
+}
+
+// Backwards-compat shim — strips poll-status updates so existing tests and
+// any chat-event-only callers keep working unchanged.
+export async function* streamChatEvents(query: string, context = ''): AsyncGenerator<ChatEvent, void, unknown> {
+  for await (const u of pollChat(query, context)) {
+    if (u.type === 'event') yield u.event
   }
 }
 
