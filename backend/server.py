@@ -35,11 +35,13 @@ logger = logging.getLogger(__name__)
 
 QUEUE_URL = os.getenv("QUEUE_URL", "")
 JOBS_TABLE = os.getenv("JOBS_TABLE", "vendor-agent-jobs")
+NOTIFICATIONS_TABLE = os.getenv("NOTIFICATIONS_TABLE", "vendor-agent-notifications")
 AWS_REGION = os.getenv("AWS_REGION", "us-west-2")
 
 sqs = boto3.client("sqs", region_name=AWS_REGION)
 dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
 table = dynamodb.Table(JOBS_TABLE)
+notifications_table = dynamodb.Table(NOTIFICATIONS_TABLE)
 
 
 app = FastAPI(
@@ -149,6 +151,22 @@ def audit(call_id: str, job_id: str) -> dict[str, Any]:
     if not blob:
         raise HTTPException(status_code=404, detail="Audit not found")
     return _from_ddb(blob)
+
+
+@app.get("/notifications")
+def notifications(limit: int = 25) -> dict[str, Any]:
+    """List the most recent dummy notifications produced by the scheduled
+    high-HHI scan. Newest first. The scan runs every 10 minutes via
+    EventBridge → scan_scheduler Lambda → SQS → orchestrator pipeline →
+    this table.
+    """
+    try:
+        response = notifications_table.scan(Limit=max(1, min(limit, 100)))
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    items = _from_ddb(response.get("Items", []))
+    items.sort(key=lambda i: i.get("created_at", ""), reverse=True)
+    return {"items": items[:limit], "count": len(items)}
 
 
 # Mount the Next.js static export last so it doesn't shadow API routes.

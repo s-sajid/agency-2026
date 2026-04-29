@@ -89,6 +89,24 @@ resource "aws_dynamodb_table" "jobs" {
   }
 }
 
+# ── DynamoDB notifications table (scheduled-scan high-HHI hits) ────────────────
+
+resource "aws_dynamodb_table" "notifications" {
+  name         = "${var.service_name}-notifications"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "notification_id"
+
+  attribute {
+    name = "notification_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+}
+
 # ── App Runner IAM ─────────────────────────────────────────────────────────────
 
 resource "aws_iam_role" "apprunner_ecr_access" {
@@ -142,6 +160,11 @@ resource "aws_iam_role_policy" "apprunner_api" {
           "dynamodb:UpdateItem",
         ]
         Resource = aws_dynamodb_table.jobs.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:Scan", "dynamodb:GetItem"]
+        Resource = aws_dynamodb_table.notifications.arn
       }
     ]
   })
@@ -160,11 +183,12 @@ resource "aws_apprunner_service" "app" {
       image_configuration {
         port = "8000"
         runtime_environment_variables = {
-          AWS_REGION       = var.region
-          PYTHONUNBUFFERED = "1"
-          QUEUE_URL        = aws_sqs_queue.jobs.url
-          JOBS_TABLE       = aws_dynamodb_table.jobs.name
-          PG_DSN           = var.pg_dsn
+          AWS_REGION          = var.region
+          PYTHONUNBUFFERED    = "1"
+          QUEUE_URL           = aws_sqs_queue.jobs.url
+          JOBS_TABLE          = aws_dynamodb_table.jobs.name
+          NOTIFICATIONS_TABLE = aws_dynamodb_table.notifications.name
+          PG_DSN              = var.pg_dsn
         }
       }
     }
@@ -352,6 +376,11 @@ resource "aws_iam_role_policy" "lambda_orchestrator_access" {
         Resource = aws_dynamodb_table.jobs.arn
       },
       {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.notifications.arn
+      },
+      {
         Effect = "Allow"
         Action = [
           "sqs:ReceiveMessage",
@@ -381,6 +410,7 @@ resource "aws_lambda_function" "orchestrator" {
       LLM_MODEL              = var.bedrock_model_id
       AWS_REGION_NAME        = var.region
       JOBS_TABLE             = aws_dynamodb_table.jobs.name
+      NOTIFICATIONS_TABLE    = aws_dynamodb_table.notifications.name
       DISCOVERY_FUNCTION     = aws_lambda_function.discovery_agent.function_name
       INVESTIGATION_FUNCTION = aws_lambda_function.investigation_agent.function_name
       VALIDATOR_FUNCTION     = aws_lambda_function.validator_agent.function_name
@@ -493,6 +523,112 @@ resource "aws_scheduler_schedule" "smoke_test" {
   }
 }
 
+# ── High-HHI scan scheduler (every 10 minutes) ─────────────────────────────────
+# Enqueues a synthetic "find concentrated categories" job onto the same SQS
+# queue the chat uses. The orchestrator runs the full agent pipeline; if any
+# HHI > 2500 finding survives the validator, a notification row is written.
+
+resource "aws_iam_role" "lambda_scan_scheduler" {
+  name = "${var.service_name}-lambda-scan-scheduler"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_scan_scheduler_basic" {
+  role       = aws_iam_role.lambda_scan_scheduler.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "lambda_scan_scheduler_access" {
+  name = "scan-scheduler-access"
+  role = aws_iam_role.lambda_scan_scheduler.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.jobs.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["dynamodb:PutItem"]
+        Resource = aws_dynamodb_table.jobs.arn
+      }
+    ]
+  })
+}
+
+resource "aws_lambda_function" "scan_scheduler" {
+  function_name    = "${var.service_name}-scan-scheduler"
+  role             = aws_iam_role.lambda_scan_scheduler.arn
+  filename         = "${path.module}/../backend/scan_scheduler/scan_scheduler.zip"
+  source_code_hash = fileexists("${path.module}/../backend/scan_scheduler/scan_scheduler.zip") ? filebase64sha256("${path.module}/../backend/scan_scheduler/scan_scheduler.zip") : null
+  handler          = "handler.handler"
+  runtime          = "python3.12"
+  timeout          = 60
+  memory_size      = 256
+
+  environment {
+    variables = {
+      QUEUE_URL  = aws_sqs_queue.jobs.url
+      JOBS_TABLE = aws_dynamodb_table.jobs.name
+    }
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.lambda_scan_scheduler_basic]
+}
+
+resource "aws_iam_role" "scan_scheduler_invoke" {
+  name = "${var.service_name}-scan-scheduler-invoke"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "scan_scheduler_invoke" {
+  name = "invoke-lambda"
+  role = aws_iam_role.scan_scheduler_invoke.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["lambda:InvokeFunction"]
+      Resource = aws_lambda_function.scan_scheduler.arn
+    }]
+  })
+}
+
+resource "aws_scheduler_schedule" "high_hhi_scan" {
+  name = "${var.service_name}-high-hhi-scan"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression = "rate(10 minutes)"
+
+  target {
+    arn      = aws_lambda_function.scan_scheduler.arn
+    role_arn = aws_iam_role.scan_scheduler_invoke.arn
+  }
+}
+
 # ── Outputs ────────────────────────────────────────────────────────────────────
 
 output "service_url" {
@@ -507,6 +643,10 @@ output "ecr_repository_url" {
 
 output "jobs_table_name" {
   value = aws_dynamodb_table.jobs.name
+}
+
+output "notifications_table_name" {
+  value = aws_dynamodb_table.notifications.name
 }
 
 output "queue_url" {

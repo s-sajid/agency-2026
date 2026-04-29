@@ -38,6 +38,7 @@ LAMBDAS: dict[str, dict] = {
     "validator_agent": {"include_shared": True, "include_references": True},
     "narrative_agent": {"include_shared": True, "include_references": True},
     "scheduler": {"include_shared": False, "include_references": False},
+    "scan_scheduler": {"include_shared": False, "include_references": False},
 }
 
 
