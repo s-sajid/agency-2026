@@ -42,6 +42,67 @@ interface ChatDrawerProps {
   onOpenChange: (open: boolean) => void
 }
 
+// ── Conversation context ───────────────────────────────────────────────────
+//
+// On every submission we serialise the prior turns into the `context` arg
+// the backend already plumbs to /chat → orchestrator → Router and every
+// specialist. Each consumer sandwiches it between a "Conversation context:"
+// header and the new question, so a plain `USER: …\n\nASSISTANT: …` text
+// format is what they expect.
+//
+// We cap aggressively — token budget matters, and the most recent few
+// turns carry almost all of the useful signal for follow-ups.
+const CONTEXT_MAX_MESSAGES = 8
+const CONTEXT_MAX_CHARS_PER_MESSAGE = 600
+
+function extractAssistantText(msg: Message): string {
+  // Prefer the Final Brief's headline + summary — it's the agent's
+  // canonical answer and (post-Narrative-paraphrase) the most useful
+  // signal for follow-up questions.
+  for (const b of msg.blocks) {
+    if (b.type === 'card' && b.result.kind === 'final_brief') {
+      const data = b.result.data
+      const parts = [data.headline, data.summary].filter(Boolean) as string[]
+      if (parts.length) return parts.join(' ')
+    }
+  }
+  // Otherwise concatenate any flowing text (e.g. narration route).
+  const text = msg.blocks
+    .filter((b): b is { type: 'text'; value: string } => b.type === 'text')
+    .map((b) => b.value)
+    .join(' ')
+    .trim()
+  if (text) return text
+  // Last resort: pull a one-line gist out of the last structured card.
+  for (let i = msg.blocks.length - 1; i >= 0; i--) {
+    const b = msg.blocks[i]
+    if (b.type !== 'card') continue
+    const r = b.result
+    if (r.kind === 'findings' && 'headline' in r.data && r.data.headline) return r.data.headline
+    if (r.kind === 'verdict' && 'verdict' in r.data && r.data.verdict) return `Verdict: ${r.data.verdict}`
+    if (r.kind === 'discovery_plan' && 'scope' in r.data && r.data.scope) return r.data.scope
+  }
+  return ''
+}
+
+function buildContext(messages: Message[]): string {
+  const tail = messages.slice(-CONTEXT_MAX_MESSAGES)
+  const turns: string[] = []
+  for (const msg of tail) {
+    if (msg.streaming) continue
+    if (msg.role === 'user') {
+      const first = msg.blocks[0]
+      if (first?.type === 'text' && first.value.trim()) {
+        turns.push(`USER: ${first.value.trim().slice(0, CONTEXT_MAX_CHARS_PER_MESSAGE)}`)
+      }
+    } else {
+      const text = extractAssistantText(msg)
+      if (text) turns.push(`ASSISTANT: ${text.slice(0, CONTEXT_MAX_CHARS_PER_MESSAGE)}`)
+    }
+  }
+  return turns.join('\n\n')
+}
+
 // ── Pipeline architecture (drives the right-side trace panel) ──────────────
 
 const PIPELINE_NODES = [
@@ -940,6 +1001,12 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
     const query = input.trim()
     if (!query || loading) return
 
+    // Capture the prior conversation BEFORE we push the new turn into
+    // state. The backend gets this via /chat → orchestrator → specialists
+    // so follow-up questions can refer to "that finding", "the IBM one",
+    // "show me the trend" etc. without losing thread.
+    const context = buildContext(messages)
+
     setInput('')
     setLoading(true)
     setMessages((prev) => [
@@ -949,7 +1016,7 @@ export function ChatDrawer({ open, onOpenChange }: ChatDrawerProps) {
     ])
 
     try {
-      for await (const update of pollChat(query)) {
+      for await (const update of pollChat(query, context)) {
         if (update.type === 'status') {
           // Authoritative "what's running on the backend right now" —
           // updated once per poll so the right panel doesn't lag the UI.
