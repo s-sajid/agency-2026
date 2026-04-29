@@ -5,6 +5,7 @@ import { useTheme } from 'next-themes'
 import { MessageSquare, Sun, Moon } from 'lucide-react'
 import { ChatDrawer } from '@/components/chat/ChatDrawer'
 import { NotificationsBell } from '@/components/layout/NotificationsBell'
+import { GithubBadge } from '@/components/layout/GithubBadge'
 
 export function Navbar() {
   const [chatOpen, setChatOpen] = useState(false)
@@ -54,6 +55,11 @@ export function Navbar() {
             >
               Vendor Intelligence
             </span>
+            <div
+              className="hidden md:block h-3.5 w-px"
+              style={{ backgroundColor: 'hsl(var(--border))' }}
+            />
+            <GithubBadge />
           </div>
 
           {/* ── Right actions ── */}
