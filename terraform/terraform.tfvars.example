@@ -1,0 +1,8 @@
+region           = "us-west-2"
+service_name     = "vendor-agent"
+bedrock_model_id = "openai.gpt-oss-120b-1:0"
+docker_image_tag = "latest"
+
+# Read-only Postgres DSN for the Render replica from the hackathon brief.
+# Copy from the project's .env (PG_DSN=...).
+pg_dsn = "ppostgresql://database_database_w2a1_user:JvqVh0msmuBrwgING68S52H0sz3wEEXI@dpg-d7auudv5r7bs738iqh70-b.replica-cyan.oregon-postgres.render.com/database_database_w2a1"

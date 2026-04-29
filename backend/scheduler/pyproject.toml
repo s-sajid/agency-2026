@@ -1,0 +1,12 @@
+[project]
+name = "vendor-agent-scheduler"
+version = "0.1.0"
+description = "Smoke-test scheduler Lambda"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.40",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
