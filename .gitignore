@@ -27,3 +27,11 @@ data/*.parquet
 Thumbs.db
 
 terraform/terraform.tfvars
+
+# Terraform state + provider binaries (state contains secrets; binaries are huge and rebuilt by `terraform init`)
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+
+# Lambda packages — rebuilt by `uv run backend/package_agents.py`
+backend/**/*.zip

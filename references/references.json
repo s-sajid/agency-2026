@@ -1,0 +1,18 @@
+{
+  "doj_hhi": {
+    "title": "U.S. DOJ Antitrust Division — Herfindahl-Hirschman Index (HHI) explainer",
+    "url": "https://www.justice.gov/atr/herfindahl-hirschman-index",
+    "accessed_date": "2026-04-28",
+    "excerpt_file": "excerpts/doj_hhi.txt",
+    "excerpt_must_contain": "Herfindahl",
+    "last_check_status": "ok"
+  },
+  "worldbank_gini": {
+    "title": "World Bank — Gini Index (SI.POV.GINI), Canada profile",
+    "url": "https://data.worldbank.org/indicator/SI.POV.GINI?locations=CA",
+    "accessed_date": "2026-04-28",
+    "excerpt_file": "excerpts/worldbank_gini.txt",
+    "excerpt_must_contain": "Gini",
+    "last_check_status": "ok"
+  }
+}

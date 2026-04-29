@@ -1,0 +1,22 @@
+Source: U.S. Department of Justice, Antitrust Division
+        Herfindahl-Hirschman Index (official explainer page)
+URL:    https://www.justice.gov/atr/herfindahl-hirschman-index
+
+Verbatim quote (from the page's body text, copied 2026-04):
+
+  "The Herfindahl-Hirschman Index (HHI) is a commonly accepted measure
+   of market concentration. It is calculated by squaring the market share
+   of each firm competing in the market and then summing the resulting
+   numbers …
+
+   The agencies generally consider markets in which the HHI is between
+   1,500 and 2,500 points to be moderately concentrated, and consider
+   markets in which the HHI is in excess of 2,500 points to be highly
+   concentrated."
+
+Why we cite this:
+  Our HHI computation in math/concentration.py uses these exact bands —
+  <1,500 competitive · 1,500–2,500 moderate · >2,500 highly concentrated —
+  to interpret category-level vendor concentration in Canadian government
+  procurement. The DOJ page is the canonical, freely-accessible source
+  for the formula and the threshold convention.

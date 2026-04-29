@@ -1,0 +1,29 @@
+[project]
+name = "vendor-agent-backend"
+version = "0.1.0"
+description = "Vendor Concentration agent — App Runner thin API + shared package"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.40",
+    "botocore>=1.40",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9,<3",
+    "python-dotenv>=1.0",
+    "psycopg2-binary>=2.9",
+    "polars>=1.18",
+    "connectorx>=0.4",
+    "pyarrow>=15,<22",
+    "strands-agents>=1.37",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vendor_concentration_agent*"]
+
+[tool.setuptools.package-data]
+vendor_concentration_agent = ["prompts/*.md"]

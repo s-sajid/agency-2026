@@ -1,0 +1,16 @@
+[project]
+name = "vendor-agent-orchestrator"
+version = "0.1.0"
+description = "Orchestrator Lambda — Router + dispatch + Final Brief"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.40",
+    "botocore>=1.40",
+    "python-dotenv>=1.0",
+    "strands-agents>=1.37",
+    "psycopg2-binary>=2.9",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

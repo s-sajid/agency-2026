@@ -1,0 +1,25 @@
+Source: World Bank — World Development Indicators
+        Gini Index (SI.POV.GINI), Canada profile
+URL:    https://data.worldbank.org/indicator/SI.POV.GINI?locations=CA
+
+Verbatim definition (from the World Bank's metadata for the
+SI.POV.GINI indicator, copied 2026-04):
+
+  "Gini index measures the extent to which the distribution of
+   income (or, in some cases, consumption expenditure) among
+   individuals or households within an economy deviates from a
+   perfectly equal distribution. … Thus a Gini index of 0
+   represents perfect equality, while an index of 100 implies
+   perfect inequality."
+
+  (Note: the World Bank reports the index on a 0–100 scale, while
+   academic and Statistics-Canada usage typically reports the
+   coefficient on a 0–1 scale. The two are equivalent — divide by
+   100 to convert.)
+
+Why we cite this:
+  Our Gini computation in math/concentration.py applies this same
+  inequality coefficient to the distribution of contract dollars
+  across vendors within a procurement category — instead of
+  household income, we measure dollar concentration among suppliers.
+  We report on the 0–1 scale (Statistics-Canada convention).
