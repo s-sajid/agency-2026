@@ -15,6 +15,7 @@ dependencies = [
     "connectorx>=0.4",
     "pyarrow>=15,<22",
     "strands-agents>=1.37",
+    "ollama>=0.4",
 ]
 
 [build-system]

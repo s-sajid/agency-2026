@@ -1,4 +1,9 @@
-"""Shared agent construction helpers — Bedrock model + prompt loading."""
+"""Shared agent construction helpers — model provider + prompt loading.
+
+`LLM_PROVIDER` selects the backend: `ollama` (default, Ollama Cloud) or
+`bedrock` (legacy AWS path, retained so the AWS deployment branch still
+works). All five agents share one cached model instance.
+"""
 
 from __future__ import annotations
 
@@ -6,30 +11,45 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
-from strands.models import BedrockModel
 from dotenv import load_dotenv
 
 load_dotenv()
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# Default model — read from .env (LLM_MODEL) which the hackathon-prep work
-# already configured with the active Bedrock model ID. Sonnet 4 / 4.6 strikes
-# the right balance of speed and capability for a 4-agent pipeline running live.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama").lower()
+
 DEFAULT_MODEL = (
     os.environ.get("LLM_MODEL")
     or os.environ.get("AGENT_MODEL_ID")
-    or "us.anthropic.claude-sonnet-4-6"
+    or ("gemma4:31b-cloud" if LLM_PROVIDER == "ollama" else "us.anthropic.claude-sonnet-4-6")
 )
-DEFAULT_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
 
 @lru_cache(maxsize=1)
-def shared_model() -> BedrockModel:
-    """One BedrockModel instance shared across all five agents — cheaper
-    than constructing per-call and identical config for every role.
-    """
-    return BedrockModel(model_id=DEFAULT_MODEL, region_name=DEFAULT_REGION)
+def shared_model():
+    """One model instance shared across all five agents."""
+    if LLM_PROVIDER == "ollama":
+        from strands.models import OllamaModel
+
+        host = os.environ.get("OLLAMA_HOST", "https://ollama.com")
+        api_key = os.environ.get("OLLAMA_CLOUD_API_KEY") or os.environ.get("OLLAMA_API_KEY")
+        client_args: dict = {}
+        if api_key:
+            client_args["headers"] = {"Authorization": f"Bearer {api_key}"}
+        return OllamaModel(
+            host=host,
+            ollama_client_args=client_args or None,
+            model_id=DEFAULT_MODEL,
+        )
+
+    if LLM_PROVIDER == "bedrock":
+        from strands.models import BedrockModel
+
+        region = os.environ.get("AWS_REGION", "us-west-2")
+        return BedrockModel(model_id=DEFAULT_MODEL, region_name=region)
+
+    raise ValueError(f"Unknown LLM_PROVIDER={LLM_PROVIDER!r} (expected 'ollama' or 'bedrock')")
 
 
 def load_prompt(name: str) -> str:
