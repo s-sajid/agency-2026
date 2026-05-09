@@ -1,12 +1,8 @@
-# Vendor Concentration — Agency 2026 (deploy branch)
+# Vendor Concentration — Agency 2026
 
-Hackathon entry for **Challenge 5: Vendor Concentration**, deployed on
-free-tier infrastructure: Vercel for the frontend, Modal for the backend,
-Ollama Cloud for the LLM, and Neon/Render for the read-only Postgres.
-
-> The original AWS deployment lives on `main` (App Runner + Lambda + SQS +
-> DynamoDB + Bedrock + Terraform). This `deploy` branch is the slimmed-down
-> reimplementation — same agent design, same `ChatEvent` contract, no AWS.
+Hackathon entry for **Challenge 5: Vendor Concentration**. Frontend on
+Vercel, backend on Modal, Ollama Cloud for the LLM, and a read-only
+Postgres for the procurement data.
 
 ## Architecture
 
@@ -72,53 +68,43 @@ flowchart LR
   — async pipeline. `POST /chat` enqueues a job and starts an
   `asyncio.create_task(run_job(...))`. The task awaits the Router, then
   the specialists in sequence, then composes a deterministic Final Brief.
-  No subprocesses, no Lambda invocations, no SQS.
+  Everything runs in one Python process — no subprocesses, no broker.
 * **SSE dispatch** — each active job has an in-memory `asyncio.Queue`.
   Events written to the SQLite store are also pushed to that queue.
   `GET /chat/stream/:id` first replays persisted events from SQLite
   (so reconnects see history), then tails the live queue.
 * **SQLite jobstore** (`vendor_concentration_agent/jobstore.py`) — single
-  file on a Modal Volume (`/data/vendor_agent.db`). Schema mirrors the
-  old DynamoDB shape (`events`, `audit`, `active_agent`, `result`,
-  `notifications`) so server.py response payloads stay byte-identical.
-* **Modal Cron** — replaces EventBridge + scan_scheduler Lambda. Hourly
-  schedule (`0 * * * *`) calls `scheduled_scan`, which builds the same
-  synthetic *"find high-HHI categories"* prompt and runs the in-process
-  orchestrator with `scheduled=True`. High-HHI hits land in the same
-  SQLite `notifications` table the bell polls.
+  file on a Modal Volume (`/data/vendor_agent.db`). Tables: `jobs`
+  (`events`, `audit`, `active_agent`, `result`) and `notifications`.
+* **Modal Cron** — hourly schedule (`0 * * * *`) calls `scheduled_scan`,
+  which builds a synthetic *"find high-HHI categories"* prompt and runs
+  the in-process orchestrator with `scheduled=True`. High-HHI hits land
+  in the SQLite `notifications` table the bell polls.
 * **Ollama Cloud** — single `OllamaModel` instance shared across the
-  five Strands agents. `LLM_PROVIDER=ollama` selects this path;
-  `LLM_PROVIDER=bedrock` is retained for the AWS branch.
+  five Strands agents.
 
 ## Layout
 
 ```
-agency-2026/  (deploy branch)
+agency-2026/
 ├── backend/
 │   ├── server.py                       FastAPI — chat, SSE stream, status, audit, dashboards
 │   ├── modal_deploy.py                 Modal entrypoint — asgi_app + scheduled_scan cron
 │   ├── pyproject.toml                  uv project; deps include strands-agents, ollama, modal
-│   ├── vendor_concentration_agent/
-│   │   ├── orchestration.py            in-process Router → specialists → Final Brief
-│   │   ├── jobstore.py                 SQLite-backed JobSink + read helpers
-│   │   ├── lambda_runtime.py           run_specialist / run_specialist_async (BufferedBus)
-│   │   ├── agents/_base.py             shared_model() — Ollama / Bedrock toggle
-│   │   ├── agents/{router,discovery,investigation,validator,narrative}.py
-│   │   ├── math/                       deterministic formulas (HHI, CR_n, Gini, …)
-│   │   ├── tools/_wrap.py              Strands @tool wrappers — emit cards into the BufferedBus
-│   │   ├── prompts/*.md                per-agent system prompts
-│   │   └── data/postgres.py            single read-only DSN helper
-│   ├── orchestrator/                   (legacy AWS Lambda handler — kept until cleanup)
-│   ├── {discovery,investigation,validator,narrative}_agent/  (legacy Lambdas)
-│   ├── scheduler/, scan_scheduler/     (legacy AWS schedulers — replaced by Modal Cron)
-│   └── package_agents.py               (legacy: Lambda zip builder)
+│   └── vendor_concentration_agent/
+│       ├── orchestration.py            in-process Router → specialists → Final Brief
+│       ├── jobstore.py                 SQLite-backed JobSink + read helpers
+│       ├── agents/_base.py             shared_model() — Ollama Cloud client
+│       ├── agents/{router,discovery,investigation,validator,narrative}.py
+│       ├── math/                       deterministic formulas (HHI, CR_n, Gini, …)
+│       ├── tools/_wrap.py              Strands @tool wrappers — emit cards into the BufferedBus
+│       ├── prompts/*.md                per-agent system prompts
+│       └── data/postgres.py            single read-only DSN helper
 ├── frontend/                           Next.js 16 — native build, deployed to Vercel
 ├── references/                         source-document registry (read by validator)
-├── docs/
-│   ├── architecture.md                 long-form analytical design
-│   ├── judges-context.md               sub-theme mapping, scoring rubric
-│   └── free-tier-redeploy.md           the deploy-branch migration plan
-└── terraform/                          (legacy AWS infra — dormant on this branch)
+└── docs/
+    ├── architecture.md                 long-form analytical design
+    └── judges-context.md               sub-theme mapping, scoring rubric
 ```
 
 ## Agents
@@ -230,8 +216,8 @@ the SQLite job record *and* publishes them onto the per-job
 `asyncio.Queue` so SSE consumers see them in real time.
 
 The React layer's `ChatEvent` shape (`text` / `tool` / `tool_done` /
-`tool_result`) is preserved exactly — same as it was on the AWS branch.
-The transport flipped (poll → SSE) but the event shape did not.
+`tool_result`) is the source of truth — `lib/api.ts` decodes the SSE
+stream into these events and `ChatDrawer` renders them.
 
 ### Validator gates
 
@@ -380,8 +366,8 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 pnpm dev
 ```
 
 The local backend uses the same SQLite store (file at
-`backend/vendor_agent.db`, gitignored). The chat path is fully exercised
-locally — no AWS, no Modal — as long as `OLLAMA_CLOUD_API_KEY` is set.
+`backend/vendor_agent.db`, gitignored). The chat path runs end-to-end
+locally as long as `OLLAMA_CLOUD_API_KEY` and `PG_DSN` are set.
 
 ## Deploy
 
@@ -422,24 +408,3 @@ again. Logs: `uv run modal app logs vendor-agent`. Manual cron run:
 Production tracks `deploy`; previews are auto-created per push. After
 the first Vercel deploy, update the Modal `vendor-agent` secret's
 `CORS_ORIGINS` to the production Vercel URL and redeploy the backend.
-
-## What's different from `main`
-
-| Concern | `main` (AWS) | `deploy` (free tier) |
-|---|---|---|
-| Frontend host | App Runner serves Next.js static export | Vercel native Next.js |
-| Backend host | App Runner container | Modal asgi_app |
-| Orchestrator | Lambda, SQS-triggered, 15 min | Modal function, in-process |
-| 4 specialists | 4 Lambdas, sync `lambda:InvokeFunction` | In-process awaits |
-| Job queue | SQS (910s visibility, DLQ) | Per-job asyncio.Queue (no broker) |
-| Job state | DynamoDB `vendor-agent-jobs` (24h TTL) | SQLite on Modal Volume |
-| Notifications | DynamoDB `vendor-agent-notifications` (7d TTL) | Same SQLite, separate table |
-| Auto-scan scheduler | EventBridge → scan_scheduler Lambda → SQS | Modal `Cron("0 * * * *")` |
-| Smoke test | EventBridge → Lambda → CloudWatch metric | Dropped (UptimeRobot if you want one) |
-| LLM | Bedrock `openai.gpt-oss-120b` | Ollama Cloud `gemma4:31b-cloud` |
-| Frontend transport | poll `GET /status/:id` every 1s | SSE on `GET /chat/stream/:id` |
-| IaC | Terraform (ECR, App Runner, SQS, Dynamo, 5 Lambdas, EventBridge, IAM) | None — `modal deploy` + Vercel git integration |
-
-`ChatEvent` shape, agent prompts, math layer, references contract, and
-Final Brief composition are unchanged. See `docs/free-tier-redeploy.md`
-for the migration plan and rationale.
