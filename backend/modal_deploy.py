@@ -82,11 +82,13 @@ async def scheduled_scan():
     from vendor_concentration_agent.jobstore import SqliteJobSink
     from vendor_concentration_agent.orchestration import run_job
 
+    # Phrased to route to `pipeline` (uses "what … and why" — see
+    # prompts/router.md). "Identify the top N" would route to `discovery`,
+    # which skips Final Brief and therefore skips _maybe_notify.
     prompt = (
-        "Scan the procurement dataset and identify the top 3 categories "
-        "with the highest vendor concentration (HHI). For each, report "
-        "the HHI value, the dominant vendor, and the share of category "
-        "spend they captured."
+        "What is the most concentrated procurement category right now, "
+        "and why? Report the HHI value, the dominant vendor, and how "
+        "long they have held it."
     )
     sink = SqliteJobSink()
     job_id = str(uuid.uuid4())

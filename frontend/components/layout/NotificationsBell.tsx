@@ -51,7 +51,7 @@ export function NotificationsBell() {
     let cancelled = false
     async function tick() {
       try {
-        const r = await fetchNotifications()
+        const r = await fetchNotifications(5)
         if (!cancelled) setItems(r.items)
       } catch {
         /* keep prior state */
@@ -207,7 +207,7 @@ export function NotificationsBell() {
             <p className="text-[10.5px] text-muted-foreground leading-relaxed">
               A background scan runs the full{' '}
               <span className="text-foreground font-medium">Discovery → Investigation → Validator → Narrative</span>{' '}
-              pipeline every 10 minutes. An alert fires when validated findings include any category with HHI{' '}
+              pipeline every hour. An alert fires when validated findings include any category with HHI{' '}
               <span className="font-mono font-semibold text-foreground">&gt; 2500</span> — the DOJ &ldquo;highly concentrated&rdquo; threshold.
             </p>
           </div>
@@ -314,7 +314,7 @@ export function NotificationsBell() {
             style={{ background: 'hsl(var(--muted) / 0.3)' }}
           >
             <span className="text-muted-foreground/70">
-              Scans every 10 min · 7-day retention
+              Scans hourly · 7-day retention
             </span>
             <span className="flex items-center gap-1 text-muted-foreground/70">
               <span
