@@ -1,120 +1,124 @@
-# Vendor Concentration — Agency 2026 (deployed)
+# Vendor Concentration — Agency 2026 (deploy branch)
 
-Hackathon entry for **Challenge 5: Vendor Concentration**, packaged for
-async deployment on AWS.
+Hackathon entry for **Challenge 5: Vendor Concentration**, deployed on
+free-tier infrastructure: Vercel for the frontend, Modal for the backend,
+Ollama Cloud for the LLM, and Neon/Render for the read-only Postgres.
+
+> The original AWS deployment lives on `main` (App Runner + Lambda + SQS +
+> DynamoDB + Bedrock + Terraform). This `deploy` branch is the slimmed-down
+> reimplementation — same agent design, same `ChatEvent` contract, no AWS.
 
 ## Architecture
 
-`POST /chat` enqueues a job and returns `{job_id}`. The frontend polls
-`GET /status/:id` every ~1s and re-renders progress from the appended
-`events[]` log written by the orchestrator and specialist Lambdas.
+`POST /chat` returns `{job_id}` and starts the orchestration as an
+in-process asyncio task. The browser opens an `EventSource` on
+`GET /chat/stream/:job_id` and renders progress as Server-Sent Events
+arrive — same `ChatEvent` shape (`text` / `tool` / `tool_done` /
+`tool_result`) the original SSE-from-funding-loops contract specified.
+Job state is persisted to a SQLite file on a Modal Volume so `/status`,
+`/audit`, and the notification-dossier modal can read historical jobs
+on reconnect.
 
 ```mermaid
 flowchart LR
-    Browser["Browser<br/>(Next.js static export)"]
-    AppRunner["App Runner<br/>(FastAPI)<br/>POST /chat · GET /status/:id<br/>GET /audit/:call_id · /dashboard/*"]
-    DDB[("DynamoDB<br/>vendor-agent-jobs<br/>events[] · audit{} · result")]
-    SQS[["SQS<br/>vendor-agent-jobs<br/>(DLQ on 3 failures)"]]
-    Orch["Orchestrator Lambda<br/>(SQS-triggered, 15 min)<br/>Router → dispatch → Final Brief"]
-    Disc["discovery-agent λ"]
-    Inv["investigation-agent λ"]
-    Val["validator-agent λ"]
-    Narr["narrative-agent λ"]
+    Browser["Browser<br/>(Next.js on Vercel)"]
+    Modal["Modal Web Function<br/>(FastAPI, asgi_app)<br/>POST /chat · GET /chat/stream/:id<br/>GET /status/:id · GET /audit/:cid<br/>GET /notifications · /dashboard/*"]
+    SQLite[("SQLite on Modal Volume<br/>jobs(events[], audit{}, result)<br/>notifications(hits, ...)")]
+    Orch["In-process orchestrator<br/>(asyncio task per job)<br/>Router → dispatch → Final Brief"]
+    Disc["Discovery agent"]
+    Inv["Investigation agent"]
+    Val["Validator agent"]
+    Narr["Narrative agent"]
     PG[("Postgres<br/>(read-only)")]
-    Bedrock["Amazon Bedrock<br/>(openai.gpt-oss-120b)"]
-    Sched["Smoke-test scheduler λ<br/>rate(5 min) → /health"]
-    CW["CloudWatch<br/>vendor-agent/SmokeTest/Healthy"]
-    EB["EventBridge<br/>rate(10 min)"]
-    ScanSched["scan_scheduler λ<br/>enqueues a synthetic<br/>'find high-HHI categories' prompt"]
-    Notif[("DynamoDB<br/>vendor-agent-notifications<br/>(7-day TTL)")]
+    Ollama["Ollama Cloud<br/>(gemma4:31b-cloud)"]
+    Cron["Modal Cron<br/>schedule: 0 * * * *"]
+    ScanFn["scheduled_scan function<br/>synthesises 'find high-HHI<br/>categories' prompt"]
 
-    Browser -- "POST /chat" --> AppRunner
-    Browser -- "poll /status/:id every 1s" --> AppRunner
-    Browser -- "GET /notifications every 30s" --> AppRunner
-    AppRunner -- "put job" --> DDB
-    AppRunner -- "enqueue" --> SQS
-    SQS --> Orch
-    Orch <-- "Router LLM call" --> Bedrock
-    Orch -- "InvokeFunction (sync)" --> Disc
-    Orch -- "InvokeFunction (sync)" --> Inv
-    Orch -- "InvokeFunction (sync)" --> Val
-    Orch -- "InvokeFunction (sync)" --> Narr
-    Disc <--> Bedrock
-    Inv <--> Bedrock
-    Val <--> Bedrock
-    Narr <--> Bedrock
+    Browser -- "POST /chat" --> Modal
+    Browser -- "EventSource /chat/stream/:id" --> Modal
+    Browser -- "GET /notifications every 30s" --> Modal
+    Modal -- "create job + start task" --> Orch
+    Orch <-- "Router LLM call" --> Ollama
+    Orch -- "await" --> Disc
+    Orch -- "await" --> Inv
+    Orch -- "await" --> Val
+    Orch -- "await" --> Narr
+    Disc <--> Ollama
+    Inv <--> Ollama
+    Val <--> Ollama
+    Narr <--> Ollama
     Disc -. "math tools" .-> PG
     Inv -. "math tools" .-> PG
     Val -. "math tools" .-> PG
-    Orch -- "append events / audit / result" --> DDB
-    Orch -. "scheduled & HHI > 2500" .-> Notif
-    AppRunner -- "GET /status, /audit" --> DDB
-    AppRunner -- "GET /notifications" --> Notif
-    AppRunner -- "/dashboard/*" --> PG
-    Sched --> AppRunner
-    Sched -- "PutMetricData" --> CW
-    EB --> ScanSched
-    ScanSched -- "enqueue (scheduled=true)" --> SQS
+    Orch -- "append events / audit / result" --> SQLite
+    Orch -- "publish to SSE queue" --> Modal
+    Orch -. "scheduled & HHI > 2500" .-> SQLite
+    Modal -- "/status, /audit, /notifications" --> SQLite
+    Modal -- "/dashboard/*" --> PG
+    Cron --> ScanFn
+    ScanFn -- "run_job(scheduled=true)" --> Orch
 ```
 
-* **App Runner** — thin FastAPI service. `POST /chat` enqueues a job and
-  returns `{job_id}`; `GET /status/:id` returns the appended event log
-  plus the currently-active agent. Also serves the Next.js static export
-  under `/` and the read-only `/dashboard/*` Postgres endpoints used by
-  the homepage charts.
-* **Orchestrator Lambda** — SQS-triggered, 15-min timeout. Runs the
-  Router (one Bedrock call, no tools) inline, dispatches to specialist
-  Lambdas (sequential pipeline for the `pipeline` route, single fan-out
-  for the others), composes a deterministic Final Brief, writes
-  everything into DynamoDB.
-* **4 specialist Lambdas** — Discovery, Investigation, Validator,
-  Narrative. Each builds the Strands agent it owns, runs it inside a
-  `BufferedBus` (the Lambda analogue of the in-process EventBus), and
-  returns `{parsed, raw_text, events, audit}` for the orchestrator to
-  merge into the job record.
-* **DynamoDB jobs table** — single hash key `job_id`, 24-hour TTL.
-  Carries `events[]` (append-only log shaped exactly like the React
-  layer's `ChatEvent`), `audit{}` (per-call_id math-tool blobs), and the
-  final `result`.
-* **SQS queue** — 910s visibility timeout (must exceed the orchestrator
-  Lambda timeout); DLQ after 3 failed receives.
-* **Smoke-test scheduler** — EventBridge schedule fires a Lambda every
-  5 minutes. The Lambda pings `/health` and emits a CloudWatch metric
-  (`vendor-agent/SmokeTest/Healthy`).
-* **Auto-scan scheduler** — separate EventBridge schedule fires the
-  `scan_scheduler` Lambda every 10 minutes. It enqueues a synthetic
-  *"find high-HHI categories"* prompt onto the same SQS queue as
-  user-facing chat, with `scheduled: true` on the message. The
-  orchestrator runs the same pipeline as a user question; if the
-  validated Final Brief contains any HHI metric over 2500 (the DOJ
-  *highly concentrated* threshold), the orchestrator writes a row to
-  the `vendor-agent-notifications` DynamoDB table. The frontend
-  navbar's bell icon polls `GET /notifications` every 30 seconds; a
-  click opens a "case dossier" modal with the headline, paraphrased
-  summary, hits, cross-checks, and recommended action. See
-  [Auto-scan & notifications](#auto-scan--notifications) below.
+* **Vercel** — hosts the Next.js 16 frontend (native, not static export).
+  Production tracks the `deploy` branch; preview deploys are created per
+  PR. Browser talks directly to Modal via
+  `NEXT_PUBLIC_BACKEND_URL=https://<workspace>--vendor-agent-web.modal.run`.
+* **Modal Web function** — FastAPI app exposed as an `asgi_app`. Runs the
+  orchestrator and all four specialist agents in a single Python
+  process. `min_containers=1` keeps one warm so the demo doesn't
+  cold-start on the first chat. `max_inputs=10` allows concurrent jobs
+  on the same container.
+* **In-process orchestrator** (`vendor_concentration_agent/orchestration.py`)
+  — async pipeline. `POST /chat` enqueues a job and starts an
+  `asyncio.create_task(run_job(...))`. The task awaits the Router, then
+  the specialists in sequence, then composes a deterministic Final Brief.
+  No subprocesses, no Lambda invocations, no SQS.
+* **SSE dispatch** — each active job has an in-memory `asyncio.Queue`.
+  Events written to the SQLite store are also pushed to that queue.
+  `GET /chat/stream/:id` first replays persisted events from SQLite
+  (so reconnects see history), then tails the live queue.
+* **SQLite jobstore** (`vendor_concentration_agent/jobstore.py`) — single
+  file on a Modal Volume (`/data/vendor_agent.db`). Schema mirrors the
+  old DynamoDB shape (`events`, `audit`, `active_agent`, `result`,
+  `notifications`) so server.py response payloads stay byte-identical.
+* **Modal Cron** — replaces EventBridge + scan_scheduler Lambda. Hourly
+  schedule (`0 * * * *`) calls `scheduled_scan`, which builds the same
+  synthetic *"find high-HHI categories"* prompt and runs the in-process
+  orchestrator with `scheduled=True`. High-HHI hits land in the same
+  SQLite `notifications` table the bell polls.
+* **Ollama Cloud** — single `OllamaModel` instance shared across the
+  five Strands agents. `LLM_PROVIDER=ollama` selects this path;
+  `LLM_PROVIDER=bedrock` is retained for the AWS branch.
 
 ## Layout
 
 ```
-agency-2026/
-├── Dockerfile               App Runner image (pnpm build → static export, uv → uvicorn)
+agency-2026/  (deploy branch)
 ├── backend/
-│   ├── server.py                       FastAPI (chat, status, audit, dashboards, static)
-│   ├── pyproject.toml                  uv project for the App Runner image
-│   ├── package_agents.py               builds linux/amd64 Lambda zips via Docker
-│   ├── vendor_concentration_agent/     shared package — math, agents, tools, prompts, …
-│   ├── orchestrator/handler.py         SQS entry; Router + dispatch + Final Brief
-│   ├── discovery_agent/handler.py      thin wrapper over build_discovery_agent
-│   ├── investigation_agent/handler.py
-│   ├── validator_agent/handler.py
-│   ├── narrative_agent/handler.py
-│   ├── scheduler/handler.py            CloudWatch smoke-test (5-min)
-│   └── scan_scheduler/handler.py       auto-scan trigger (10-min)
-├── frontend/                Next.js 16 app — `output: 'export'`, pnpm
-├── references/              source-document registry (referenced by the validator)
-├── terraform/               main.tf, variables.tf, terraform.tfvars.example
-└── docs/                    architecture + judges briefing
+│   ├── server.py                       FastAPI — chat, SSE stream, status, audit, dashboards
+│   ├── modal_deploy.py                 Modal entrypoint — asgi_app + scheduled_scan cron
+│   ├── pyproject.toml                  uv project; deps include strands-agents, ollama, modal
+│   ├── vendor_concentration_agent/
+│   │   ├── orchestration.py            in-process Router → specialists → Final Brief
+│   │   ├── jobstore.py                 SQLite-backed JobSink + read helpers
+│   │   ├── lambda_runtime.py           run_specialist / run_specialist_async (BufferedBus)
+│   │   ├── agents/_base.py             shared_model() — Ollama / Bedrock toggle
+│   │   ├── agents/{router,discovery,investigation,validator,narrative}.py
+│   │   ├── math/                       deterministic formulas (HHI, CR_n, Gini, …)
+│   │   ├── tools/_wrap.py              Strands @tool wrappers — emit cards into the BufferedBus
+│   │   ├── prompts/*.md                per-agent system prompts
+│   │   └── data/postgres.py            single read-only DSN helper
+│   ├── orchestrator/                   (legacy AWS Lambda handler — kept until cleanup)
+│   ├── {discovery,investigation,validator,narrative}_agent/  (legacy Lambdas)
+│   ├── scheduler/, scan_scheduler/     (legacy AWS schedulers — replaced by Modal Cron)
+│   └── package_agents.py               (legacy: Lambda zip builder)
+├── frontend/                           Next.js 16 — native build, deployed to Vercel
+├── references/                         source-document registry (read by validator)
+├── docs/
+│   ├── architecture.md                 long-form analytical design
+│   ├── judges-context.md               sub-theme mapping, scoring rubric
+│   └── free-tier-redeploy.md           the deploy-branch migration plan
+└── terraform/                          (legacy AWS infra — dormant on this branch)
 ```
 
 ## Agents
@@ -122,7 +126,7 @@ agency-2026/
 The system answers Challenge 5 — *"In any given category of government
 spending, how many vendors are actually competing? Where has incumbency
 replaced competition?"* — with a five-agent pipeline. Every agent is a
-Strands `Agent` running on Amazon Bedrock; each has a tightly-scoped
+Strands `Agent` running on Ollama Cloud; each has a tightly-scoped
 prompt and a curated subset of deterministic math tools. Agents reason
 about which tools to call; **the tools compute the numbers**. No agent
 ever invents a figure.
@@ -146,13 +150,13 @@ DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  NARRATIVE  →  FINAL BRIEF
                                                only)         JSON template)
 ```
 
-- The **Router** runs inline inside the Orchestrator Lambda. The four
-  **specialists** each live in their own Lambda and are invoked
-  synchronously by the orchestrator (`lambda:InvokeFunction`).
+- The **Router** runs first inside `run_job`. The four **specialists**
+  run as in-process awaits in the same asyncio task — no separate
+  workers, no IPC.
 - For the `pipeline` route the orchestrator runs Discovery →
   Investigation → Validator sequentially, threading each agent's
   `raw_text` into the next as conversational context. Once the
-  Validator's verdict lands, the orchestrator invokes Narrative in
+  Validator's verdict lands, the orchestrator awaits Narrative in
   **paraphrase mode** with the three structured outputs and the
   user's original question; Narrative returns
   `{"summary": "<2-3 sentences>"}` constrained to use only values
@@ -165,19 +169,19 @@ DISCOVERY  →  INVESTIGATION  →  VALIDATOR  →  NARRATIVE  →  FINAL BRIEF
   Narrative call fails, the brief falls back to a mechanical summary
   so the pipeline still ships an answer.
 - For the `discovery`, `investigation`, `validation`, or `narration`
-  routes the orchestrator invokes only that one specialist (Narrative
+  routes the orchestrator runs only that one specialist (Narrative
   on the standalone `narration` route runs free-form, not in
   paraphrase mode).
 
 ### Per-agent responsibilities & tools
 
-| Agent | Lives in | Job | Tools |
+| Agent | Role | Job | Tools |
 |---|---|---|---|
-| **Router** | Orchestrator Lambda (inline) | Classify the question into one of 6 routes (`pipeline`, `discovery`, `investigation`, `validation`, `narration`, `out_of_scope`). | *None* — pure classification |
-| **Discovery** | `discovery_agent` Lambda | Reframe the question into a measurable claim. Pick the dataset/category/dimension. Surface 3–5 candidate concentrated categories worth drilling into. Output: an investigation plan. | `list_top_concentrated_categories` |
-| **Investigation** | `investigation_agent` Lambda | Compute the actual numbers. For each candidate from Discovery, run concentration metrics and surface the dominant vendor, its share, and how long it has held the category. Every figure carries its `tool_call_id` so the audit drawer can show the SQL + source rows. | `hhi_for_category`, `cr_n_for_category`, `gini_for_category`, `sole_source_share`, `how_long_has_vendor_held_category`, `vendor_full_footprint`, `how_many_distinct_vendors_in_category` |
-| **Validator** | `validator_agent` Lambda | Cross-check Investigation's findings against a *second* source — sibling table (sole-source vs. competitive), cross-jurisdiction (AB ↔ FED ↔ open.canada.ca via `general.entity_match`), or finer-grained re-slice. Issue `MATCH` / `PARTIAL` / `DIVERGE` verdicts. Rule out by-design singletons (RCMP, Receiver General). | `cross_dataset_lookup_for_vendor`, `compare_two_computations`, `sole_source_share` *(deliberately NOT given the Investigation toolkit — letting Validator re-run HHI/CR_n with slightly different inputs would manufacture false DIVERGE verdicts)* |
-| **Narrative** | `narrative_agent` Lambda | Two modes. **Paraphrase mode** (pipeline route): given the user's question + Discovery / Investigation / Validator structured outputs, emit a 2–3 sentence summary that answers the question using only values already present in those outputs — no new numbers, names, percentages, or claims. **Narration mode** (standalone `narration` route): re-explain a prior finding in plain English when the user explicitly asks. | *None* — writing only |
+| **Router** | inline in `run_job` | Classify the question into one of 6 routes (`pipeline`, `discovery`, `investigation`, `validation`, `narration`, `out_of_scope`). | *None* — pure classification |
+| **Discovery** | `build_discovery_agent` | Reframe the question into a measurable claim. Pick the dataset/category/dimension. Surface 3–5 candidate concentrated categories worth drilling into. Output: an investigation plan. | `list_top_concentrated_categories` |
+| **Investigation** | `build_investigation_agent` | Compute the actual numbers. For each candidate from Discovery, run concentration metrics and surface the dominant vendor, its share, and how long it has held the category. Every figure carries its `tool_call_id` so the audit drawer can show the SQL + source rows. | `hhi_for_category`, `cr_n_for_category`, `gini_for_category`, `sole_source_share`, `how_long_has_vendor_held_category`, `vendor_full_footprint`, `how_many_distinct_vendors_in_category` |
+| **Validator** | `build_validator_agent` | Cross-check Investigation's findings against a *second* source — sibling table (sole-source vs. competitive), cross-jurisdiction (AB ↔ FED ↔ open.canada.ca via `general.entity_match`), or finer-grained re-slice. Issue `MATCH` / `PARTIAL` / `DIVERGE` verdicts. Rule out by-design singletons (RCMP, Receiver General). | `cross_dataset_lookup_for_vendor`, `compare_two_computations`, `sole_source_share` *(deliberately NOT given the Investigation toolkit — letting Validator re-run HHI/CR_n with slightly different inputs would manufacture false DIVERGE verdicts)* |
+| **Narrative** | `build_narrative_agent` | Two modes. **Paraphrase mode** (pipeline route): given the user's question + Discovery / Investigation / Validator structured outputs, emit a 2–3 sentence summary that answers the question using only values already present in those outputs — no new numbers, names, percentages, or claims. **Narration mode** (standalone `narration` route): re-explain a prior finding in plain English when the user explicitly asks. | *None* — writing only |
 
 ### The math layer (the trust boundary)
 
@@ -213,21 +217,21 @@ around it. **No invented metrics** — no `lockin_score`, no custom risk
 indices. If a formula isn't in a textbook, government policy doc, or
 standard methodology page, it doesn't ship.
 
-### Cross-Lambda state — `BufferedBus`
+### In-process state — `BufferedBus`
 
-Each specialist Lambda sets a `BufferedBus` on a contextvar before
-running its agent. The Strands `@tool` wrappers in `tools/_wrap.py` push
-math-tool cards (`tool` / `tool_result` / `tool_done` events) and audit
-blobs (`{call_id → {sql, source_rows, …}}`) into the bus. After the
-agent finishes, the Lambda dumps the bus and returns
+Each specialist sets a `BufferedBus` on a contextvar before its agent
+runs (via `run_specialist_async` in `lambda_runtime.py`). The Strands
+`@tool` wrappers in `tools/_wrap.py` push math-tool cards (`tool` /
+`tool_result` / `tool_done` events) and audit blobs
+(`{call_id → {sql, source_rows, …}}`) into the bus. After the agent
+finishes, `run_specialist_async` dumps the bus and returns
 `{parsed, raw_text, events, audit}`. The orchestrator merges those into
-the DynamoDB job record so the polling frontend can render progress
-agent-by-agent and tool-by-tool.
+the SQLite job record *and* publishes them onto the per-job
+`asyncio.Queue` so SSE consumers see them in real time.
 
-This is the Lambda analogue of the in-process `EventBus`. The React
-layer's `ChatEvent` shape (`text` / `tool` / `tool_done` /
-`tool_result`) is preserved exactly — the transport changed (SSE →
-poll) but the event shape did not.
+The React layer's `ChatEvent` shape (`text` / `tool` / `tool_done` /
+`tool_result`) is preserved exactly — same as it was on the AWS branch.
+The transport flipped (poll → SSE) but the event shape did not.
 
 ### Validator gates
 
@@ -262,28 +266,28 @@ the brief always ships with *some* summary.
 ## Auto-scan & notifications
 
 The same agent pipeline that answers user questions also runs
-proactively on a 10-minute cron, scanning for high-concentration
+proactively on an hourly Modal Cron, scanning for high-concentration
 categories without being asked.
 
 ### Flow
 
 ```
-EventBridge (rate(10 min))
+Modal Cron (0 * * * *)
        │
        ▼
-scan_scheduler λ
-       │  enqueues SQS message:
-       │    { "message": "Scan government spending and identify any
-       │                  category with an HHI above 2500 …",
-       │      "scheduled": true }
+scheduled_scan function
+       │  builds prompt:
+       │    "Scan the procurement dataset and identify the top 3
+       │     categories with the highest vendor concentration (HHI) …"
+       │
        ▼
-orchestrator (same code path as user chat)
+run_job(scheduled=True)  (same code path as user chat)
        │  Router → Discovery → Investigation → Validator → Narrative → Final Brief
        │
        ▼
 _maybe_notify():
   if scheduled AND brief.metrics_table contains an HHI metric > 2500:
-      write a row to vendor-agent-notifications DynamoDB
+      sink.save_notification({...})  →  SQLite notifications table
        │
        ▼
 GET /notifications  ←  navbar bell polls every 30s
@@ -298,37 +302,34 @@ The auto-scan reuses every part of the user pipeline — the Validator
 still gates on cross-checks, the Narrative still paraphrases, the
 Final Brief still composes deterministically. The only differences:
 
-- The triggering message is synthesised by the `scan_scheduler`
-  Lambda, not typed by a user.
-- The orchestrator inspects `scheduled: true` on the SQS message and
-  calls `_maybe_notify()` after the brief is composed.
+- The triggering message is synthesised by the `scheduled_scan` Modal
+  function, not typed by a user.
+- `run_job` is called with `scheduled=True`, which gates the
+  notification write at the end of the pipeline.
 - Notifications are filtered to high-HHI hits *only* — a clean run
-  with no concentrations over the DOJ threshold writes nothing to
-  the table.
+  with no concentrations over the DOJ threshold writes nothing.
 
 ### Notifications table
 
-Schema in `vendor-agent-notifications` DynamoDB:
+SQLite schema (`notifications`):
 
-```json
-{
-  "notification_id": "<uuid>",
-  "created_at":      "<ISO 8601 UTC>",
-  "source_job_id":   "<orchestrator job ID; trace back to events/audit>",
-  "question":        "<the synthetic prompt that triggered the scan>",
-  "headline":        "<from final_brief>",
-  "summary":         "<from final_brief — Narrative paraphrase>",
-  "verdict":         "MATCH | PARTIAL | DIVERGE | INSUFFICIENT_DATA",
-  "confidence":      "high | medium | low",
-  "sub_theme":       "Efficiency | Integrity | Alignment",
-  "hits": [
-    { "metric": "HHI", "value": 4231, "interpretation": "highly concentrated", "call_id": "hhi-…" }
-  ],
-  "ttl": "<unix epoch + 7 days>"
-}
+```sql
+CREATE TABLE notifications (
+    notification_id  TEXT PRIMARY KEY,
+    source_job_id    TEXT,             -- trace back to jobs.events / audit
+    created_at       TEXT NOT NULL,    -- ISO 8601 UTC
+    question         TEXT,             -- the synthetic prompt
+    headline         TEXT,             -- from final_brief
+    summary          TEXT,             -- Narrative paraphrase
+    verdict          TEXT,             -- MATCH | PARTIAL | DIVERGE | INSUFFICIENT_DATA
+    confidence       TEXT,             -- high | medium | low
+    sub_theme        TEXT,             -- Efficiency | Integrity | Alignment
+    hits             TEXT NOT NULL     -- JSON [{metric, value, interpretation, call_id}]
+);
 ```
 
-7-day TTL — DynamoDB will reap older rows automatically.
+`list_notifications()` filters out rows older than 7 days at read time;
+`sweep_expired_jobs()` is called opportunistically to keep the file lean.
 
 ### Frontend surfaces
 
@@ -340,46 +341,33 @@ The navbar bell (`components/layout/NotificationsBell.tsx`):
   `last-seen` timestamp (`localStorage.agency2026.notifications.last-seen`).
 - Opens a portalled panel with a header that explains the pipeline
   cadence and the trigger threshold, plus a list of recent
-  notifications (Syne headline, paraphrased summary, verdict pill,
-  sub-theme label, hit count, mono timestamp).
-- Empty state: *"Auto-scan is running. No high-concentration alerts
-  yet."*
+  notifications.
 
 Clicking a row opens a **case dossier** modal
-(`components/layout/NotificationDetailModal.tsx`):
-
-- Verdict-coloured 5 px accent bar runs the full vertical edge of
-  the modal.
-- Hero header — sub-theme kicker, monospace dossier ID, Syne
-  headline, ISO timestamp · job ID · source-table metadata strip,
-  pills for verdict / confidence / hit count.
-- Sections divided by hairline rules with tracked-out Syne kicker
-  labels (`TRIGGER`, `SUMMARY`, `PRIMARY FINDING`, `CROSS-CHECKS`,
-  `RECOMMENDED ACTION`, `SIMILAR CATEGORIES ELSEWHERE`).
-- Primary finding card holds the headline HHI, a 4-column dossier
-  `<dl>` (dominant vendor, ministry, share %, tenure), and an inline
-  4-quarter SVG sparkline.
-- Some fields are still dummy enrichment for now (vendor / ministry
-  / sparkline / similar-categories list); they're keyed off the
-  notification ID so each row's dossier is deterministic.
+(`components/layout/NotificationDetailModal.tsx`) — verdict-coloured
+accent bar, hero header (sub-theme kicker, dossier ID, headline,
+metadata strip, verdict/confidence/hit pills), and sections for
+trigger, summary, primary finding, cross-checks, recommended action,
+and similar categories elsewhere. Some enrichment fields are still
+deterministic dummies keyed off the notification ID.
 
 ### Extending beyond the in-app bell
 
-The current `_emit_notification()` writes to DynamoDB; production
-deployments would typically fan out to one or more of:
+`save_notification()` writes to SQLite; production deployments would
+typically fan out to one or more of:
 
 | Channel | How |
 |---|---|
-| Slack | `requests.post(SLACK_WEBHOOK_URL, json={...})` next to the DDB write |
-| Email / SMS | publish to an SNS topic with subscribers |
+| Slack | `httpx.post(SLACK_WEBHOOK_URL, json={...})` next to the SQLite write |
+| Email | Resend / Postmark / SES, called from the same path |
 | Browser push | `Notification.requestPermission()` in the bell + tie `new Notification(...)` to the poll loop |
-| Daily digest | a second scheduled Lambda that scans the table at 09:00 and composes a single email |
+| Daily digest | a second `@app.function(schedule=modal.Cron("0 9 * * *"))` that reads the table and composes a single email |
 
 ## Local development
 
 ```bash
 # Backend
-cp .env.example .env   # fill PG_DSN; AWS_* not needed for /dashboard
+cp .env.example .env   # set OLLAMA_CLOUD_API_KEY and PG_DSN
 cd backend
 uv sync
 uv run uvicorn server:app --reload --port 8000
@@ -391,31 +379,67 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 pnpm dev
 # http://localhost:3000
 ```
 
-`POST /chat` requires `QUEUE_URL` + AWS creds for SQS — for pure
-dashboard work it's optional. To exercise the chat path locally you'd
-need to deploy the queue/Lambdas (or stub them in the orchestrator).
+The local backend uses the same SQLite store (file at
+`backend/vendor_agent.db`, gitignored). The chat path is fully exercised
+locally — no AWS, no Modal — as long as `OLLAMA_CLOUD_API_KEY` is set.
 
 ## Deploy
 
+### Backend → Modal
+
 ```bash
-# 1. Build all Lambda zips (Docker required)
-uv run backend/package_agents.py
+cd backend
 
-# 2. Configure terraform vars
-cd terraform
-cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars      # set pg_dsn at minimum
+# First time: authenticate
+uv run modal token new
 
-# 3. Apply
-terraform init
-terraform apply
-# Outputs: service_url, ecr_repository_url, jobs_table_name, queue_url
+# Create the secret (or update via the dashboard at modal.com/secrets)
+uv run modal secret create vendor-agent \
+    LLM_PROVIDER=ollama \
+    LLM_MODEL=gemma4:31b-cloud \
+    OLLAMA_HOST=https://ollama.com \
+    OLLAMA_CLOUD_API_KEY=... \
+    PG_DSN='postgresql://...' \
+    CORS_ORIGINS='https://your-app.vercel.app'
+
+# Deploy
+uv run modal deploy modal_deploy.py
+# Outputs a URL like:
+#   https://<workspace>--vendor-agent-web.modal.run
 ```
 
-Subsequent code-only updates:
+Subsequent code-only updates: `uv run modal deploy modal_deploy.py`
+again. Logs: `uv run modal app logs vendor-agent`. Manual cron run:
+`uv run modal run modal_deploy.py::scheduled_scan`.
 
-* **Lambda change**: re-run `uv run backend/package_agents.py` then
-  `terraform apply`.
-* **App Runner change**: `terraform apply` rebuilds + pushes the image
-  (the docker_image resource has `no_cache = true`); App Runner has
-  `auto_deployments_enabled = true` and picks it up from ECR.
+### Frontend → Vercel
+
+- Import `s-sajid/agency-2026` at https://vercel.com/new
+- Root Directory: `frontend`
+- Environment variable: `NEXT_PUBLIC_BACKEND_URL` = the Modal web URL
+- Settings → Environments → Production → Branch Tracking: `deploy`
+
+Production tracks `deploy`; previews are auto-created per push. After
+the first Vercel deploy, update the Modal `vendor-agent` secret's
+`CORS_ORIGINS` to the production Vercel URL and redeploy the backend.
+
+## What's different from `main`
+
+| Concern | `main` (AWS) | `deploy` (free tier) |
+|---|---|---|
+| Frontend host | App Runner serves Next.js static export | Vercel native Next.js |
+| Backend host | App Runner container | Modal asgi_app |
+| Orchestrator | Lambda, SQS-triggered, 15 min | Modal function, in-process |
+| 4 specialists | 4 Lambdas, sync `lambda:InvokeFunction` | In-process awaits |
+| Job queue | SQS (910s visibility, DLQ) | Per-job asyncio.Queue (no broker) |
+| Job state | DynamoDB `vendor-agent-jobs` (24h TTL) | SQLite on Modal Volume |
+| Notifications | DynamoDB `vendor-agent-notifications` (7d TTL) | Same SQLite, separate table |
+| Auto-scan scheduler | EventBridge → scan_scheduler Lambda → SQS | Modal `Cron("0 * * * *")` |
+| Smoke test | EventBridge → Lambda → CloudWatch metric | Dropped (UptimeRobot if you want one) |
+| LLM | Bedrock `openai.gpt-oss-120b` | Ollama Cloud `gemma4:31b-cloud` |
+| Frontend transport | poll `GET /status/:id` every 1s | SSE on `GET /chat/stream/:id` |
+| IaC | Terraform (ECR, App Runner, SQS, Dynamo, 5 Lambdas, EventBridge, IAM) | None — `modal deploy` + Vercel git integration |
+
+`ChatEvent` shape, agent prompts, math layer, references contract, and
+Final Brief composition are unchanged. See `docs/free-tier-redeploy.md`
+for the migration plan and rationale.
