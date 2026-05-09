@@ -1,13 +1,10 @@
 import path from "node:path";
 import type { NextConfig } from "next";
 
-// Static-export build for the App Runner image. The FastAPI backend mounts
-// `frontend/out/` under `/` and serves it alongside /chat, /status/:id, and
-// /dashboard/*. Because there are no Next.js API routes any more, static
-// export is feasible.
+// Native Next.js on Vercel — no static export, no API routes. The
+// browser talks directly to the Modal-hosted FastAPI backend via
+// NEXT_PUBLIC_BACKEND_URL.
 const nextConfig: NextConfig = {
-  output: 'export',
-  images: { unoptimized: true },
   turbopack: {
     root: path.resolve(__dirname),
   },
