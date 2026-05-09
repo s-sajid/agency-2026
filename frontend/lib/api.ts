@@ -1,13 +1,14 @@
-// Async-polling client for the App Runner backend.
+// SSE client for the Modal-hosted backend.
 //
-// The original funding-loops repo streamed events over SSE from POST /chat.
-// This deployment uses the agency-prep-deploy job-queue shape: POST /chat
-// returns a job_id; the frontend polls GET /status/:id every ~1s and
-// reconstructs the chat state from the appended `events` log.
+// POST /chat returns {job_id}; the frontend opens an EventSource on
+// GET /chat/stream/:job_id and consumes events in real time. The same
+// ChatEvent shape (text / tool / tool_done / tool_result) is preserved
+// so ChatDrawer keeps working unchanged.
 //
-// In production the static frontend is bundled into the same App Runner
-// image as the FastAPI backend, so relative paths just work.
-// For `pnpm dev`, set NEXT_PUBLIC_BACKEND_URL=http://localhost:8000.
+// On Vercel the frontend lives at a different origin from the backend,
+// so set NEXT_PUBLIC_BACKEND_URL to the Modal endpoint (e.g.
+// https://<workspace>--vendor-agent-web.modal.run). For `pnpm dev`
+// against a local uvicorn, use http://localhost:8000.
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? ''
 
@@ -148,51 +149,111 @@ async function fetchStatus(jobId: string): Promise<JobStatus> {
   return r.json()
 }
 
-const POLL_MS = 1000
-
-// A single tick in the polling cycle yields either a chat event extracted
-// from the appended events log, or a status update with the authoritative
-// `active_agent` field that the right-side panel uses to show what's
-// currently running on the backend (vs. the cumulative events log, which
-// only reflects what has *happened*).
+// A single tick yields either a chat event extracted from the SSE
+// stream, or a status update carrying the authoritative `active_agent`
+// field that the right-side panel uses to show what's running.
+// The shape is unchanged from the polling era, so ChatDrawer doesn't
+// know the transport flipped.
 export type PollUpdate =
   | { type: 'event'; event: ChatEvent }
   | { type: 'status'; activeAgent: string[] | null; status: JobStatus['status'] }
 
+interface SseStatusPayload {
+  status: JobStatus['status']
+  result?: unknown
+  route?: { route: string; reason: string }
+  error?: string
+}
+
+interface SseActivePayload {
+  agents: string[] | null
+}
+
+// Bridge an EventSource into an async generator. Yields PollUpdate
+// values matching the previous polling contract.
 export async function* pollChat(query: string, context = ''): AsyncGenerator<PollUpdate, void, unknown> {
   const jobId = await createJob(query, context)
-  let cursor = 0
+  const url = `${BACKEND_URL}/chat/stream/${jobId}`
+  const source = new EventSource(url)
 
-  while (true) {
-    const status = await fetchStatus(jobId)
-
-    if (status.events.length > cursor) {
-      for (let i = cursor; i < status.events.length; i++) {
-        const raw = status.events[i]
-        if (raw.kind === 'error') {
-          throw new Error(String((raw.payload as { error?: string }).error ?? 'agent error'))
-        }
-        const ev = rawToChatEvent(raw)
-        if (ev) yield { type: 'event', event: ev }
-      }
-      cursor = status.events.length
+  // Single-slot async queue: producer (onmessage) hands off to consumer
+  // (the generator). If the consumer hasn't taken the previous item yet,
+  // we buffer in `pending`.
+  const pending: Array<PollUpdate | { type: '__end'; error?: Error }> = []
+  let resolver: (() => void) | null = null
+  const wake = () => {
+    if (resolver) {
+      const r = resolver
+      resolver = null
+      r()
     }
+  }
 
-    yield { type: 'status', activeAgent: status.active_agent, status: status.status }
+  source.onmessage = (e) => {
+    let raw: RawEvent | { kind: 'status'; payload: SseStatusPayload } | { kind: 'active_agent'; payload: SseActivePayload }
+    try {
+      raw = JSON.parse(e.data)
+    } catch {
+      return
+    }
+    if (raw.kind === 'status') {
+      const p = raw.payload as SseStatusPayload
+      pending.push({ type: 'status', activeAgent: null, status: p.status })
+      if (p.status === 'error') {
+        pending.push({ type: '__end', error: new Error(p.error ?? 'job failed') })
+      } else if (p.status === 'complete') {
+        pending.push({ type: '__end' })
+      }
+    } else if (raw.kind === 'active_agent') {
+      const p = raw.payload as SseActivePayload
+      pending.push({ type: 'status', activeAgent: p.agents, status: 'running' })
+    } else if (raw.kind === 'error') {
+      const err = String((raw.payload as { error?: string }).error ?? 'agent error')
+      pending.push({ type: '__end', error: new Error(err) })
+    } else {
+      const ev = rawToChatEvent(raw as RawEvent)
+      if (ev) pending.push({ type: 'event', event: ev })
+    }
+    wake()
+  }
 
-    if (status.status === 'error') throw new Error(status.error ?? 'job failed')
-    if (status.status === 'complete') return
+  source.onerror = () => {
+    // Treat connection drop as terminal — caller can retry by reissuing
+    // the query (which will hit the prompt cache and pick up the
+    // already-running job).
+    pending.push({ type: '__end', error: new Error('SSE connection lost') })
+    wake()
+  }
 
-    await new Promise((r) => setTimeout(r, POLL_MS))
+  try {
+    while (true) {
+      if (pending.length === 0) {
+        await new Promise<void>((r) => { resolver = r })
+      }
+      const next = pending.shift()!
+      if (next.type === '__end') {
+        if (next.error) throw next.error
+        return
+      }
+      yield next
+    }
+  } finally {
+    source.close()
   }
 }
 
-// Backwards-compat shim — strips poll-status updates so existing tests and
+// Backwards-compat shim — strips status updates so existing tests and
 // any chat-event-only callers keep working unchanged.
 export async function* streamChatEvents(query: string, context = ''): AsyncGenerator<ChatEvent, void, unknown> {
   for await (const u of pollChat(query, context)) {
     if (u.type === 'event') yield u.event
   }
+}
+
+// Retained for the notification-dossier modal, which fetches a
+// historical job snapshot rather than streaming.
+export async function fetchJobStatus(jobId: string): Promise<JobStatus> {
+  return fetchStatus(jobId)
 }
 
 // ── dashboards (formerly proxied through Next.js /api/* — now direct) ─────────

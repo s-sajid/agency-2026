@@ -1,61 +1,59 @@
-"""App Runner thin API.
+"""FastAPI app — single-process replacement for the App Runner + Lambda
+deployment. Hosted on Modal (or any Python host) on the `deploy` branch.
 
-  POST /chat            → enqueues a job, returns {job_id}
-  GET  /status/:id      → polled by the frontend every 2s
-  GET  /audit/:call_id  → math-tool audit (full SQL + source_rows)
-  /dashboard/*          → read-only Postgres dashboards (existing router)
-  /                     → Next.js static export (mounted last)
+  POST /chat                  → enqueue a job, return {job_id}
+  GET  /chat/stream/{job_id}  → Server-Sent Events stream for that job
+  GET  /status/{job_id}       → polled JSON snapshot (still used by the
+                                notifications dossier modal)
+  GET  /audit/{call_id}       → math-tool audit blob
+  GET  /notifications         → list of high-HHI scan results
+  GET  /dashboard/*           → read-only Postgres dashboards
+  GET  /health                → liveness probe
 
-The agent code itself runs in Lambda, not here. This service is intentionally
-boring: write a job to DynamoDB, push to SQS, return.
+The orchestrator + 4 specialist agents run in-process via
+`vendor_concentration_agent.orchestration.run_job`. Job state is
+persisted to SQLite via `vendor_concentration_agent.jobstore`. Live
+event streams are dispatched through an in-memory asyncio.Queue per
+active job_id.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
-import threading
 import time
 import uuid
-from decimal import Decimal
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from vendor_concentration_agent import jobstore
 from vendor_concentration_agent.dashboards import router as dashboards_router
+from vendor_concentration_agent.jobstore import SqliteJobSink
+from vendor_concentration_agent.orchestration import run_job
 
 load_dotenv(override=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-QUEUE_URL = os.getenv("QUEUE_URL", "")
-JOBS_TABLE = os.getenv("JOBS_TABLE", "vendor-agent-jobs")
-NOTIFICATIONS_TABLE = os.getenv("NOTIFICATIONS_TABLE", "vendor-agent-notifications")
-AWS_REGION = os.getenv("AWS_REGION", "us-west-2")
-
-sqs = boto3.client("sqs", region_name=AWS_REGION)
-dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
-table = dynamodb.Table(JOBS_TABLE)
-notifications_table = dynamodb.Table(NOTIFICATIONS_TABLE)
-
 
 app = FastAPI(
-    title="Vendor Concentration agent (App Runner)",
-    version="0.2.0",
-    description="Agency 2026 — async polling architecture on AWS",
+    title="Vendor Concentration agent (Modal)",
+    version="0.3.0",
+    description="Agency 2026 — in-process SSE on free-tier hosting",
 )
 
-cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=cors_origins or ["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -63,10 +61,6 @@ app.add_middleware(
 app.include_router(dashboards_router)
 
 
-# Browser cache layer for the homepage charts. Pairs with the in-process
-# TTL cache on each /dashboard/* route — server cache eats the Postgres
-# round-trip; browser cache eats the network round-trip on warm reloads.
-# 5 minutes matches the server-side TTL so the two layers expire together.
 @app.middleware("http")
 async def add_dashboard_cache_headers(request: Request, call_next):
     response = await call_next(request)
@@ -80,6 +74,100 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ── Live SSE dispatch ────────────────────────────────────────────────────────
+#
+# Per-job asyncio.Queue, populated by a sink wrapper. /chat/stream/:job_id
+# replays the job's persisted events from SQLite first (so reconnects /
+# late subscribers see the full history), then drains the live queue
+# until the terminal status event arrives.
+
+_active_streams: dict[str, asyncio.Queue] = {}
+
+
+class _StreamingSink:
+    """Wraps SqliteJobSink and publishes append_events / set_status
+    transitions to the per-job asyncio.Queue. The wrapped store remains
+    the source of truth so the SSE replay path can rebuild state on
+    reconnect.
+    """
+
+    def __init__(self, inner: SqliteJobSink, queue: asyncio.Queue):
+        self._inner = inner
+        self._q = queue
+
+    def set_status(self, job_id: str, status: str, **extra: Any) -> None:
+        self._inner.set_status(job_id, status, **extra)
+        self._q.put_nowait({
+            "kind": "status",
+            "payload": {
+                "status": status,
+                "result": extra.get("result"),
+                "route": extra.get("route"),
+                "error": extra.get("error"),
+            },
+        })
+
+    def append_events(self, job_id: str, events: list[dict]) -> None:
+        self._inner.append_events(job_id, events)
+        for e in events:
+            self._q.put_nowait(e)
+
+    def merge_audit(self, job_id: str, audit: dict[str, dict]) -> None:
+        self._inner.merge_audit(job_id, audit)
+
+    def set_active(self, job_id: str, agents: list[str] | None) -> None:
+        self._inner.set_active(job_id, agents)
+        self._q.put_nowait({"kind": "active_agent", "payload": {"agents": agents}})
+
+    def save_notification(self, notification: dict[str, Any]) -> None:
+        self._inner.save_notification(notification)
+
+
+# ── Prompt cache ──────────────────────────────────────────────────────────────
+#
+# Same idea as before: re-asking the same question reuses the prior
+# job_id. Cache keyed by SHA-256 of (message + context). Lookup checks
+# the SQLite jobstore for a terminal-state record.
+
+_CHAT_CACHE_TTL_SECONDS = 60 * 60
+_CHAT_CACHE_MAX_ENTRIES = 256
+_chat_cache: dict[str, tuple[str, float]] = {}
+
+
+def _hash_prompt(message: str, context: str) -> str:
+    h = hashlib.sha256()
+    h.update(message.strip().lower().encode("utf-8"))
+    h.update(b"\n---\n")
+    h.update(context.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _cache_lookup(prompt_hash: str) -> str | None:
+    hit = _chat_cache.get(prompt_hash)
+    if not hit:
+        return None
+    cached_job_id, cached_at = hit
+    if (time.time() - cached_at) > _CHAT_CACHE_TTL_SECONDS:
+        _chat_cache.pop(prompt_hash, None)
+        return None
+    job = jobstore.get_job(cached_job_id)
+    if not job:
+        _chat_cache.pop(prompt_hash, None)
+        return None
+    if job.get("status") in ("complete", "error"):
+        return cached_job_id
+    return None
+
+
+def _cache_store(prompt_hash: str, job_id: str) -> None:
+    if len(_chat_cache) >= _CHAT_CACHE_MAX_ENTRIES:
+        oldest = min(_chat_cache.items(), key=lambda kv: kv[1][1])
+        _chat_cache.pop(oldest[0], None)
+    _chat_cache[prompt_hash] = (job_id, time.time())
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 class ChatRequest(BaseModel):
     message: str
     context: str = ""
@@ -89,182 +177,132 @@ class ChatResponse(BaseModel):
     job_id: str
 
 
-# ── In-process prompt cache ───────────────────────────────────────────────────
-#
-# Re-asking the same question (same `message` + same `context`) shouldn't burn
-# the entire pipeline again. We hash the prompt, remember the job_id we
-# created for it, and on a repeat hit we return the prior job_id — the
-# frontend polls /status/:id and immediately renders the cached result.
-#
-# The cache lives in App Runner process memory: lost on container restart,
-# not shared across instances. For our 1-instance hackathon footprint that's
-# fine; on a horizontal scale-out each instance just builds its own cache.
-
-_CHAT_CACHE_TTL_SECONDS = 60 * 60  # 1 hour
-_CHAT_CACHE_MAX_ENTRIES = 256
-
-_chat_cache: dict[str, tuple[str, float]] = {}  # prompt_hash → (job_id, cached_at)
-_chat_cache_lock = threading.Lock()
-
-
-def _hash_prompt(message: str, context: str) -> str:
-    """Stable cache key. Lowercase + trim the message so trivial whitespace
-    or capitalization differences hit the same entry; keep `context` exact
-    because it's already a structured serialisation of prior turns."""
-    h = hashlib.sha256()
-    h.update(message.strip().lower().encode("utf-8"))
-    h.update(b"\n---\n")
-    h.update(context.encode("utf-8"))
-    return h.hexdigest()[:16]
-
-
-def _cache_lookup(prompt_hash: str) -> str | None:
-    """Return a cached job_id if (a) it's recent, (b) it still exists in
-    DynamoDB, and (c) it's in a terminal state (`complete` or `error`).
-    Otherwise return None and evict the stale entry."""
-    with _chat_cache_lock:
-        hit = _chat_cache.get(prompt_hash)
-    if not hit:
-        return None
-    cached_job_id, cached_at = hit
-    if (time.time() - cached_at) > _CHAT_CACHE_TTL_SECONDS:
-        with _chat_cache_lock:
-            _chat_cache.pop(prompt_hash, None)
-        return None
-    try:
-        item = table.get_item(Key={"job_id": cached_job_id}).get("Item")
-    except ClientError:
-        return None
-    status = (item or {}).get("status")
-    if status in ("complete", "error"):
-        return cached_job_id
-    if not item:
-        # The prior job TTL'd out of DDB — drop the cache entry.
-        with _chat_cache_lock:
-            _chat_cache.pop(prompt_hash, None)
-    # `pending` / `running` falls through and creates a new job; we don't
-    # coalesce in-flight requests because the orchestrator's idempotency
-    # surface (DDB writes keyed by job_id) doesn't promise that.
-    return None
-
-
-def _cache_store(prompt_hash: str, job_id: str) -> None:
-    with _chat_cache_lock:
-        # Cheap eviction: if we're at the cap, drop the oldest entry.
-        if len(_chat_cache) >= _CHAT_CACHE_MAX_ENTRIES:
-            oldest = min(_chat_cache.items(), key=lambda kv: kv[1][1])
-            _chat_cache.pop(oldest[0], None)
-        _chat_cache[prompt_hash] = (job_id, time.time())
-
-
 @app.post("/chat", response_model=ChatResponse)
-def chat(body: ChatRequest) -> ChatResponse:
+async def chat(body: ChatRequest) -> ChatResponse:
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-    if not QUEUE_URL:
-        raise HTTPException(status_code=500, detail="QUEUE_URL not configured")
 
     prompt_hash = _hash_prompt(body.message, body.context)
-
-    # Re-asked? Reuse the prior job_id. Frontend polls /status/:id and gets
-    # the cached complete result instantly — no Bedrock, no SQS, no Lambda.
     cached_job_id = _cache_lookup(prompt_hash)
     if cached_job_id:
         logger.info("Cache hit on prompt %s → job %s", prompt_hash, cached_job_id)
         return ChatResponse(job_id=cached_job_id)
 
     job_id = str(uuid.uuid4())
-    table.put_item(Item={
-        "job_id": job_id,
-        "status": "pending",
-        "message": body.message,
-        "context": body.context,
-        "events": [],
-        "audit": {},
-        "ttl": int(time.time()) + 86400,
-    })
-    sqs.send_message(
-        QueueUrl=QUEUE_URL,
-        MessageBody=json.dumps({
-            "job_id": job_id,
-            "message": body.message,
-            "context": body.context,
-        }),
-    )
+    sink = SqliteJobSink()
+    sink.create_job(job_id, body.message, body.context)
+
+    queue: asyncio.Queue = asyncio.Queue()
+    _active_streams[job_id] = queue
+    streaming_sink = _StreamingSink(sink, queue)
+
+    async def _run():
+        try:
+            await run_job(job_id, streaming_sink, body.message, body.context)
+        except Exception:
+            logger.exception("run_job failed for %s", job_id)
+        finally:
+            queue.put_nowait({"kind": "_done"})
+
+    asyncio.create_task(_run())
     _cache_store(prompt_hash, job_id)
-    logger.info("Enqueued job %s (prompt %s)", job_id, prompt_hash)
     return ChatResponse(job_id=job_id)
 
 
-def _from_ddb(value: Any) -> Any:
-    """Recursively unwrap DynamoDB Decimals back to int/float so the JSON
-    response uses native numeric types (the frontend chart components
-    expect numbers, not strings)."""
-    if isinstance(value, Decimal):
-        # Decimal -> int when the value is a whole number, else float
-        return int(value) if value == value.to_integral_value() else float(value)
-    if isinstance(value, dict):
-        return {k: _from_ddb(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_from_ddb(v) for v in value]
-    return value
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+@app.get("/chat/stream/{job_id}")
+async def chat_stream(job_id: str) -> StreamingResponse:
+    """Server-Sent Events stream of the job's events.
+
+    Replays persisted events from SQLite first, then tails the live
+    queue if the job is still running. Emits a terminal `status` event
+    and closes when the orchestrator is done.
+    """
+    job = jobstore.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    queue = _active_streams.get(job_id)
+    already_replayed = len(job.get("events") or [])
+
+    async def _gen():
+        # 1. Replay persisted events.
+        for e in job.get("events") or []:
+            yield _sse(e)
+        if job.get("active_agent"):
+            yield _sse({"kind": "active_agent", "payload": {"agents": job["active_agent"]}})
+        if job.get("status") in ("complete", "error"):
+            yield _sse({
+                "kind": "status",
+                "payload": {
+                    "status": job["status"],
+                    "result": job.get("result"),
+                    "route": job.get("route"),
+                    "error": job.get("error"),
+                },
+            })
+            return
+
+        # 2. Tail the live queue, skipping events we already replayed.
+        if queue is None:
+            # Job is in a non-terminal status but has no live queue —
+            # probably a server restart. Close the stream; the client
+            # can fall back to /status polling.
+            yield _sse({"kind": "status", "payload": {"status": job.get("status") or "unknown"}})
+            return
+
+        seen = 0
+        while True:
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            if ev.get("kind") == "_done":
+                break
+            # Skip any append_events the queue replayed that we already
+            # streamed from SQLite (shouldn't happen if the client
+            # connected before the first append, but defend anyway).
+            if ev.get("kind") not in ("status", "active_agent"):
+                seen += 1
+                if seen <= already_replayed:
+                    continue
+            yield _sse(ev)
+        _active_streams.pop(job_id, None)
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/status/{job_id}")
 def status(job_id: str) -> dict[str, Any]:
-    try:
-        item = table.get_item(Key={"job_id": job_id}).get("Item")
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    if not item:
+    job = jobstore.get_job(job_id)
+    if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # `audit` is intentionally omitted from the polling response — it can be
-    # large, and the frontend only needs it on demand via /audit/:call_id.
-    return _from_ddb({
-        "job_id": job_id,
-        "status": item.get("status"),
-        "events": item.get("events", []),
-        "active_agent": item.get("active_agent"),
-        "result": item.get("result"),
-        "route": item.get("route"),
-        "error": item.get("error"),
-    })
+    return job
 
 
 @app.get("/audit/{call_id}")
 def audit(call_id: str, job_id: str) -> dict[str, Any]:
-    """Fetch one math-tool audit blob. The frontend already has the call_id
-    from the chat card; it knows the job_id from the polling cycle.
-    """
-    item = table.get_item(Key={"job_id": job_id}).get("Item")
-    if not item:
-        raise HTTPException(status_code=404, detail="Job not found")
-    blob = (item.get("audit") or {}).get(call_id)
-    if not blob:
+    blob = jobstore.get_audit_blob(job_id, call_id)
+    if blob is None:
         raise HTTPException(status_code=404, detail="Audit not found")
-    return _from_ddb(blob)
+    return blob
 
 
 @app.get("/notifications")
 def notifications(limit: int = 25) -> dict[str, Any]:
-    """List the most recent dummy notifications produced by the scheduled
-    high-HHI scan. Newest first. The scan runs every 10 minutes via
-    EventBridge → scan_scheduler Lambda → SQS → orchestrator pipeline →
-    this table.
-    """
-    try:
-        response = notifications_table.scan(Limit=max(1, min(limit, 100)))
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    items = _from_ddb(response.get("Items", []))
-    items.sort(key=lambda i: i.get("created_at", ""), reverse=True)
-    return {"items": items[:limit], "count": len(items)}
-
-
-# Mount the Next.js static export last so it doesn't shadow API routes.
-if os.path.exists("static"):
-    from fastapi.staticfiles import StaticFiles
-    app.mount("/", StaticFiles(directory="static", html=True), name="static")
+    return jobstore.list_notifications(limit=limit)
 
 
 if __name__ == "__main__":
