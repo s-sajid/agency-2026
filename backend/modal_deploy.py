@@ -26,11 +26,16 @@ import modal
 
 # Build the image from this directory's pyproject.toml so the deployed
 # Modal container has the same dependency graph as local dev.
+# add_local_dir is used (not add_local_python_source) so the prompts/*.md
+# files in the package travel with the .py files.
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libpq-dev", "gcc")
     .pip_install_from_pyproject("pyproject.toml")
-    .add_local_python_source("vendor_concentration_agent")
+    .add_local_dir(
+        "vendor_concentration_agent",
+        remote_path="/root/vendor_concentration_agent",
+    )
     .add_local_file("server.py", "/root/server.py")
 )
 
