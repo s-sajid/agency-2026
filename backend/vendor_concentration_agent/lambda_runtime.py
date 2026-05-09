@@ -75,3 +75,17 @@ def run_specialist(
 ) -> dict[str, Any]:
     """Synchronous entry point for Lambda handlers."""
     return asyncio.run(_run(name, agent_factory, user_input, question_label or name))
+
+
+async def run_specialist_async(
+    name: str,
+    agent_factory: Callable,
+    user_input: str,
+    question_label: str = "",
+) -> dict[str, Any]:
+    """Async entry point for in-process callers (server.py / Modal).
+    Same semantics as run_specialist but awaitable so it composes with
+    an already-running event loop instead of trying to start a nested
+    one via asyncio.run().
+    """
+    return await _run(name, agent_factory, user_input, question_label or name)

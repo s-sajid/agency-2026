@@ -32,7 +32,7 @@ from vendor_concentration_agent.agents import (
     build_validator_agent,
 )
 from vendor_concentration_agent.final_brief import build_final_brief
-from vendor_concentration_agent.lambda_runtime import run_specialist
+from vendor_concentration_agent.lambda_runtime import run_specialist_async
 
 
 logger = logging.getLogger(__name__)
@@ -145,14 +145,14 @@ async def classify(question: str, context: str) -> dict[str, str]:
 
 # ── Specialist runner ─────────────────────────────────────────────────────────
 
-def _run(job_id: str, sink: JobSink, name: str, factory, user_input: str, label: str) -> dict:
-    """Run a specialist agent in-process. Sets active_agent, calls
-    run_specialist (which sets up its own BufferedBus), then merges the
-    bus's events + audit into the job sink.
+async def _run(job_id: str, sink: JobSink, name: str, factory, user_input: str, label: str) -> dict:
+    """Run a specialist agent in-process. Sets active_agent, awaits the
+    async run_specialist (which sets up its own BufferedBus), then
+    merges the bus's events + audit into the job sink.
     """
     sink.set_active(job_id, [name])
     try:
-        result = run_specialist(name, factory, user_input, label[:80])
+        result = await run_specialist_async(name, factory, user_input, label[:80])
     finally:
         sink.set_active(job_id, None)
     sink.append_events(job_id, result.get("events", []))
@@ -162,21 +162,21 @@ def _run(job_id: str, sink: JobSink, name: str, factory, user_input: str, label:
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
-def _run_pipeline(job_id: str, sink: JobSink, question: str, context: str) -> dict:
-    discovery = _run(job_id, sink, "discovery", build_discovery_agent,
-                     _discovery_input(question, context), question)
+async def _run_pipeline(job_id: str, sink: JobSink, question: str, context: str) -> dict:
+    discovery = await _run(job_id, sink, "discovery", build_discovery_agent,
+                           _discovery_input(question, context), question)
 
-    investigation = _run(job_id, sink, "investigation", build_investigation_agent,
-                         _investigation_input(question, context, discovery.get("raw_text", "")),
-                         question)
+    investigation = await _run(job_id, sink, "investigation", build_investigation_agent,
+                               _investigation_input(question, context, discovery.get("raw_text", "")),
+                               question)
 
-    validator = _run(job_id, sink, "validator", build_validator_agent,
-                     _validator_input(question, context, investigation.get("raw_text", "")),
-                     question)
+    validator = await _run(job_id, sink, "validator", build_validator_agent,
+                           _validator_input(question, context, investigation.get("raw_text", "")),
+                           question)
 
     narrative_summary = ""
     try:
-        narrative = _run(
+        narrative = await _run(
             job_id, sink, "narrative", build_narrative_agent,
             _paraphrase_input(
                 question,
@@ -215,22 +215,22 @@ def _run_pipeline(job_id: str, sink: JobSink, question: str, context: str) -> di
     return {"final_brief": brief}
 
 
-def _run_single(job_id: str, sink: JobSink, route: str, question: str, context: str) -> dict:
+async def _run_single(job_id: str, sink: JobSink, route: str, question: str, context: str) -> dict:
     if route == "discovery":
-        result = _run(job_id, sink, "discovery", build_discovery_agent,
-                      _discovery_input(question, context), question)
+        result = await _run(job_id, sink, "discovery", build_discovery_agent,
+                            _discovery_input(question, context), question)
         return {"specialist": "discovery", "raw_text": result.get("raw_text", "")}
     if route == "investigation":
-        result = _run(job_id, sink, "investigation", build_investigation_agent,
-                      _investigation_input(question, context, ""), question)
+        result = await _run(job_id, sink, "investigation", build_investigation_agent,
+                            _investigation_input(question, context, ""), question)
         return {"specialist": "investigation", "raw_text": result.get("raw_text", "")}
     if route == "validation":
-        result = _run(job_id, sink, "validator", build_validator_agent,
-                      _validator_input(question, context, ""), question)
+        result = await _run(job_id, sink, "validator", build_validator_agent,
+                            _validator_input(question, context, ""), question)
         return {"specialist": "validator", "raw_text": result.get("raw_text", "")}
     if route == "narration":
-        result = _run(job_id, sink, "narrative", build_narrative_agent,
-                      _narration_input(question, context), question)
+        result = await _run(job_id, sink, "narrative", build_narrative_agent,
+                            _narration_input(question, context), question)
         return {"specialist": "narrative", "raw_text": result.get("raw_text", "")}
     raise ValueError(f"unknown single-route: {route}")
 
@@ -310,16 +310,16 @@ async def run_job(
         sink.set_active(job_id, None)
 
         if route == "pipeline":
-            result = _run_pipeline(job_id, sink, message, context)
+            result = await _run_pipeline(job_id, sink, message, context)
             _maybe_notify(sink, job_id, scheduled, message, result.get("final_brief") or {})
         elif route in ("discovery", "investigation", "validation"):
-            result = _run_single(job_id, sink, route, message, context)
+            result = await _run_single(job_id, sink, route, message, context)
         elif route == "narration":
             if not context.strip():
                 sink.append_events(job_id, [{"kind": "text", "payload": {"text": NARRATION_NEEDS_CONTEXT_MSG}}])
                 result = {"text": NARRATION_NEEDS_CONTEXT_MSG}
             else:
-                result = _run_single(job_id, sink, "narration", message, context)
+                result = await _run_single(job_id, sink, "narration", message, context)
         else:  # out_of_scope
             sink.append_events(job_id, [{"kind": "text", "payload": {"text": OUT_OF_SCOPE_MSG}}])
             result = {"text": OUT_OF_SCOPE_MSG}
