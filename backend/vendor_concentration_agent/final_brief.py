@@ -10,7 +10,29 @@ If a field can't be sourced, it's omitted (not faked).
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+
+_ENTITY_RX = re.compile(
+    r"^([A-Z][\w&'.\-]*"
+    r"(?:\s+(?:[A-Z][\w&'.\-]*|(?:of|and|de|du|la|le|the|von|van)(?=\s+[A-Z])))*)"
+)
+
+
+def _extract_entity_from_headline(headline: str | None) -> str | None:
+    """Best-effort fallback when the Validator didn't produce a
+    canonical_name: grab the leading proper-noun phrase from the
+    headline (capitalised tokens plus common connectors). Used as the
+    secondary dedup key for auto-scan notifications.
+    """
+    if not headline:
+        return None
+    m = _ENTITY_RX.match(headline.strip())
+    if not m:
+        return None
+    name = m.group(1).strip(" .,:;-")
+    return name if len(name) >= 3 else None
 
 
 def _coalesce(*values: Any) -> Any:
@@ -283,9 +305,13 @@ def build_final_brief(
     confidence = verdict.get("confidence")
 
     summary = (narrative_summary or "").strip() or _summary(findings, verdict, plan)
+    headline = _headline(findings, verdict)
+
+    canonical = (verdict.get("cross_dataset") or {}).get("canonical_name")
+    entity = canonical or _extract_entity_from_headline(headline)
 
     return {
-        "headline": _headline(findings, verdict),
+        "headline": headline,
         "summary": summary,
         "metrics_table": metrics_table,
         "sub_theme": sub_theme,
@@ -293,4 +319,5 @@ def build_final_brief(
         "confidence": confidence,
         "recommendation": _recommendation(findings, verdict),
         "caveats": _caveats(findings, verdict, plan),
+        "entity": entity,
     }

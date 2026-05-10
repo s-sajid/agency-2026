@@ -325,6 +325,7 @@ export interface Notification {
   verdict?: 'MATCH' | 'PARTIAL' | 'DIVERGE' | 'INSUFFICIENT_DATA'
   confidence?: 'high' | 'medium' | 'low'
   sub_theme?: 'Efficiency' | 'Integrity' | 'Alignment'
+  entity?: string
   hits: NotificationHit[]
 }
 

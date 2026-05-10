@@ -117,11 +117,16 @@ def _init_schema(c: sqlite3.Connection) -> None:
             verdict TEXT,
             confidence TEXT,
             sub_theme TEXT,
+            entity TEXT,
             hits TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_created_at
             ON notifications(created_at);
     """)
+    # Migration for DBs created before the entity column existed.
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
+    if "entity" not in cols:
+        c.execute("ALTER TABLE notifications ADD COLUMN entity TEXT")
 
 
 def _now() -> str:
@@ -209,8 +214,8 @@ class SqliteJobSink:
         c.execute(
             "INSERT OR REPLACE INTO notifications "
             "(notification_id, source_job_id, created_at, question, headline, "
-            " summary, verdict, confidence, sub_theme, hits) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " summary, verdict, confidence, sub_theme, entity, hits) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 notification["notification_id"],
                 notification.get("source_job_id"),
@@ -221,6 +226,7 @@ class SqliteJobSink:
                 notification.get("verdict"),
                 notification.get("confidence"),
                 notification.get("sub_theme"),
+                notification.get("entity"),
                 _dumps(notification.get("hits") or []),
             ),
         )
@@ -278,6 +284,7 @@ def list_notifications(limit: int = 25) -> dict[str, Any]:
             "verdict": r["verdict"],
             "confidence": r["confidence"],
             "sub_theme": r["sub_theme"],
+            "entity": r["entity"],
             "hits": _loads(r["hits"], []),
         }
         for r in rows
