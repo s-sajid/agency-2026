@@ -276,6 +276,11 @@ def _maybe_notify(sink: JobSink, job_id: str, scheduled: bool, question: str, br
         "confidence": brief.get("confidence"),
         "sub_theme": brief.get("sub_theme"),
         "entity": brief.get("entity"),
+        "category": brief.get("category"),
+        "recommendation": brief.get("recommendation"),
+        "metrics_table": brief.get("metrics_table") or [],
+        "caveats": brief.get("caveats") or [],
+        "cross_checks": brief.get("cross_checks") or [],
         "hits": hits,
     })
     logger.info("Notification written for job %s (%d hit(s))", job_id, len(hits))

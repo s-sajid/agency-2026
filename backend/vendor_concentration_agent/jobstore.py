@@ -118,15 +118,28 @@ def _init_schema(c: sqlite3.Connection) -> None:
             confidence TEXT,
             sub_theme TEXT,
             entity TEXT,
+            category TEXT,
+            recommendation TEXT,
+            metrics_table TEXT NOT NULL DEFAULT '[]',
+            caveats TEXT NOT NULL DEFAULT '[]',
+            cross_checks TEXT NOT NULL DEFAULT '[]',
             hits TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_created_at
             ON notifications(created_at);
     """)
-    # Migration for DBs created before the entity column existed.
+    # Idempotent migrations for DBs created before each column existed.
     cols = {r["name"] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
-    if "entity" not in cols:
-        c.execute("ALTER TABLE notifications ADD COLUMN entity TEXT")
+    for name, ddl in [
+        ("entity", "ALTER TABLE notifications ADD COLUMN entity TEXT"),
+        ("category", "ALTER TABLE notifications ADD COLUMN category TEXT"),
+        ("recommendation", "ALTER TABLE notifications ADD COLUMN recommendation TEXT"),
+        ("metrics_table", "ALTER TABLE notifications ADD COLUMN metrics_table TEXT NOT NULL DEFAULT '[]'"),
+        ("caveats", "ALTER TABLE notifications ADD COLUMN caveats TEXT NOT NULL DEFAULT '[]'"),
+        ("cross_checks", "ALTER TABLE notifications ADD COLUMN cross_checks TEXT NOT NULL DEFAULT '[]'"),
+    ]:
+        if name not in cols:
+            c.execute(ddl)
 
 
 def _now() -> str:
@@ -214,8 +227,9 @@ class SqliteJobSink:
         c.execute(
             "INSERT OR REPLACE INTO notifications "
             "(notification_id, source_job_id, created_at, question, headline, "
-            " summary, verdict, confidence, sub_theme, entity, hits) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " summary, verdict, confidence, sub_theme, entity, category, "
+            " recommendation, metrics_table, caveats, cross_checks, hits) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 notification["notification_id"],
                 notification.get("source_job_id"),
@@ -227,6 +241,11 @@ class SqliteJobSink:
                 notification.get("confidence"),
                 notification.get("sub_theme"),
                 notification.get("entity"),
+                notification.get("category"),
+                notification.get("recommendation"),
+                _dumps(notification.get("metrics_table") or []),
+                _dumps(notification.get("caveats") or []),
+                _dumps(notification.get("cross_checks") or []),
                 _dumps(notification.get("hits") or []),
             ),
         )
@@ -285,6 +304,11 @@ def list_notifications(limit: int = 25) -> dict[str, Any]:
             "confidence": r["confidence"],
             "sub_theme": r["sub_theme"],
             "entity": r["entity"],
+            "category": r["category"],
+            "recommendation": r["recommendation"],
+            "metrics_table": _loads(r["metrics_table"], []),
+            "caveats": _loads(r["caveats"], []),
+            "cross_checks": _loads(r["cross_checks"], []),
             "hits": _loads(r["hits"], []),
         }
         for r in rows
