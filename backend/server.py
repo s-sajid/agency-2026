@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dotenv import load_dotenv
@@ -44,10 +46,55 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+async def _prewarm_dashboards() -> None:
+    """Pre-call every dashboard endpoint with default args so the cache
+    is hot before the first user request lands. After a fresh container
+    boot the L2 disk cache fills the L1 dict on first hit (cheap); on
+    a truly cold boot (empty Volume / first-ever deploy) this pays the
+    full Postgres latency once per endpoint, but keeps users out of
+    that path entirely.
+
+    Per-endpoint failures are logged and ignored so one flaky chart
+    doesn't block the whole startup.
+    """
+    started = time.time()
+    n_ok = 0
+    n_fail = 0
+    for route in dashboards_router.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None or not callable(endpoint):
+            continue
+        sig = inspect.signature(endpoint)
+        if any(p.default is inspect.Parameter.empty for p in sig.parameters.values()):
+            # Endpoint with required args — skip; we only warm defaults.
+            continue
+        try:
+            result = endpoint()
+            if inspect.iscoroutine(result):
+                await result
+            n_ok += 1
+        except Exception as e:
+            n_fail += 1
+            logger.warning("Dashboard pre-warm failed for %s: %s",
+                           getattr(route, "path", "?"), e)
+    logger.info("Dashboard pre-warm complete: %d ok, %d fail in %.2fs",
+                n_ok, n_fail, time.time() - started)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await _prewarm_dashboards()
+    except Exception:
+        logger.exception("Dashboard pre-warm raised; serving cold")
+    yield
+
+
 app = FastAPI(
     title="Vendor Concentration agent (Modal)",
     version="0.3.0",
     description="Agency 2026 — in-process SSE on free-tier hosting",
+    lifespan=lifespan,
 )
 
 cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -61,11 +108,17 @@ app.add_middleware(
 app.include_router(dashboards_router)
 
 
+# Match the server-side TTL (1h) and let the browser keep showing the
+# cached chart while it revalidates in the background — avoids the
+# blank-flash refresh experience.
+_DASHBOARD_BROWSER_CACHE = "public, max-age=3600, stale-while-revalidate=86400"
+
+
 @app.middleware("http")
 async def add_dashboard_cache_headers(request: Request, call_next):
     response = await call_next(request)
     if request.url.path.startswith("/dashboard/"):
-        response.headers.setdefault("Cache-Control", "public, max-age=300")
+        response.headers.setdefault("Cache-Control", _DASHBOARD_BROWSER_CACHE)
     return response
 
 
