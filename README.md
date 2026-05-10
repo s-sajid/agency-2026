@@ -4,6 +4,28 @@ Hackathon entry for **Challenge 5: Vendor Concentration**. Frontend on
 Vercel, backend on Modal, Ollama Cloud for the LLM, and a read-only
 Postgres for the procurement data.
 
+## Technology stack
+
+| Layer | Technology | Where it lives |
+|---|---|---|
+| Frontend | Next.js 16 (native, App Router) | `frontend/` |
+| | React 19.2 + Tailwind CSS v4 + Radix UI | |
+| | Recharts | dashboard charts |
+| | pnpm 9 | package manager (never `npm`) |
+| Frontend host | Vercel (Hobby) | Production tracks `deploy` branch |
+| Backend (API) | FastAPI + uvicorn + Pydantic v2 | `backend/server.py` |
+| | uv | Python project + lockfile manager (never `pip`) |
+| Backend host | Modal — `@modal.asgi_app()` + `modal.Cron` | `backend/modal_deploy.py` |
+| Agent runtime | Strands Agents SDK (`Agent`, `@tool`) | `vendor_concentration_agent/agents/` |
+| | Python 3.12 `asyncio` | in-process orchestration; no queue, no broker |
+| LLM (default) | Ollama Cloud — `gemma4:31b-cloud` | `LLM_PROVIDER=ollama` |
+| LLM (legacy) | AWS Bedrock — `us.anthropic.claude-sonnet-4-6` | `LLM_PROVIDER=bedrock` (the AWS-variant path) |
+| Job + notification store | SQLite on a Modal Volume | `vendor_concentration_agent/jobstore.py` |
+| Source data | Render-hosted Postgres (read-only replica) | `data/postgres.py` (agent tools), `dashboards.py` (charts) |
+| Postgres clients | `psycopg2` (agent math tools), `connectorx` + `polars` (dashboards) | |
+| Transport | Server-Sent Events | browser `EventSource` ↔ `/chat/stream/:job_id` |
+| IaC | None for `deploy`; archived Terraform retained for the AWS variant | `terraform/` |
+
 ## Architecture
 
 `POST /chat` returns `{job_id}` and starts the orchestration as an
@@ -27,7 +49,7 @@ flowchart LR
     Narr["Narrative agent"]
     PG[("Postgres<br/>(read-only)")]
     Ollama["Ollama Cloud<br/>(gemma4:31b-cloud)"]
-    Cron["Modal Cron<br/>schedule: 0 * * * *"]
+    Cron["Modal Cron<br/>schedule: 0 0 * * 1 (weekly)"]
     ScanFn["scheduled_scan function<br/>synthesises 'find high-HHI<br/>categories' prompt"]
 
     Browser -- "POST /chat" --> Modal
@@ -76,12 +98,178 @@ flowchart LR
 * **SQLite jobstore** (`vendor_concentration_agent/jobstore.py`) — single
   file on a Modal Volume (`/data/vendor_agent.db`). Tables: `jobs`
   (`events`, `audit`, `active_agent`, `result`) and `notifications`.
-* **Modal Cron** — hourly schedule (`0 * * * *`) calls `scheduled_scan`,
-  which builds a synthetic *"find high-HHI categories"* prompt and runs
-  the in-process orchestrator with `scheduled=True`. High-HHI hits land
-  in the SQLite `notifications` table the bell polls.
+* **Modal Cron** — weekly schedule (`0 0 * * 1`, Mon 00:00 UTC) calls
+  `scheduled_scan`, which builds a synthetic *"find high-HHI categories"*
+  prompt and runs the in-process orchestrator with `scheduled=True`.
+  High-HHI hits land in the SQLite `notifications` table the bell polls.
+  Cadence was throttled from hourly to weekly as a temporary cost
+  control — flip the `schedule=` arg in `modal_deploy.py` to dial it
+  back up.
 * **Ollama Cloud** — single `OllamaModel` instance shared across the
   five Strands agents.
+
+## Application architecture
+
+The deployment diagram above shows *where* things run. This one shows
+*what happens inside* the Modal container when a request lands — the
+in-process flow from `POST /chat` through the Router, the four
+specialists, the math layer, and back out over SSE.
+
+```mermaid
+flowchart TB
+    Browser["Browser (Next.js on Vercel)"]
+
+    subgraph App["Modal container — single Python process"]
+        direction TB
+        Chat["POST /chat<br/>(server.py)"]
+        PCache[("Prompt cache<br/>SHA-256(message+context) → job_id<br/>1h TTL · 256 entries · in-process")]
+        Job["run_job — asyncio task<br/>(orchestration.py)"]
+        Queue[("Per-job<br/>asyncio.Queue")]
+        Stream["GET /chat/stream/:id<br/>SSE — replay SQLite then tail queue"]
+
+        Router["Router agent<br/>1 LLM call · no tools<br/>classifies into 6 routes"]
+        D["Discovery"]
+        I["Investigation"]
+        V["Validator"]
+        N["Narrative<br/>(paraphrase mode)"]
+        FB["build_final_brief<br/>deterministic template"]
+
+        Wrap["@tool wrappers<br/>tools/_wrap.py"]
+        Bus["BufferedBus<br/>contextvar per agent"]
+        Math["Math layer<br/>hhi · cr_n · gini · sole_source<br/>incumbency · footprint · cross-check"]
+    end
+
+    SQLite[("SQLite on Modal Volume<br/>jobs · notifications · dashboard_cache")]
+    PG[("Render Postgres<br/>read-only replica")]
+    Ollama["Ollama Cloud<br/>gemma4:31b-cloud"]
+    Cron["Modal Cron<br/>scheduled_scan (weekly)"]
+
+    Browser -- "POST /chat" --> Chat
+    Browser -- "EventSource" --> Stream
+    Chat --> PCache
+    PCache -- "hit · reuse job_id" --> Stream
+    PCache -- "miss" --> Job
+    Job --> Queue
+    Job --> Router
+    Router -- "pipeline route" --> D
+    Router -. "single route" .-> I
+    Router -. .-> V
+    Router -. .-> N
+    D --> I --> V --> N --> FB
+
+    Router <-- "LLM" --> Ollama
+    D <-- "LLM" --> Ollama
+    I <-- "LLM" --> Ollama
+    V <-- "LLM" --> Ollama
+    N <-- "LLM" --> Ollama
+
+    D -. "tool call" .-> Wrap
+    I -. "tool call" .-> Wrap
+    V -. "tool call" .-> Wrap
+    Wrap --> Math
+    Math --> PG
+    Wrap -- "push events + audit" --> Bus
+    Bus -- "merge after agent" --> SQLite
+    Bus -- "publish live" --> Queue
+    FB -- "tool_result + paraphrase text" --> Queue
+
+    Stream <-- "replay history" --> SQLite
+    Stream <-- "tail live" --> Queue
+
+    Cron -- "run_job(scheduled=True)" --> Job
+```
+
+**Reading the flow:**
+
+1. **Request hits `POST /chat`.** `server.py` hashes `(message, context)`
+   and looks up the prompt cache. On hit, the existing `job_id` is
+   returned and the browser's `EventSource` replays the persisted
+   events out of SQLite — no LLM, no DB, sub-100 ms answer.
+2. **On a miss**, a new `job_id` is minted, the SQLite job row is
+   created, an `asyncio.Queue` is registered, and `run_job` is launched
+   as an `asyncio.create_task`. The browser opens its `EventSource`
+   immediately and starts seeing events.
+3. **The Router** runs inline — one LLM call, no tools — and writes
+   its `tool` / `tool_result` / `tool_done` events. It chooses one of
+   six routes (`pipeline`, `discovery`, `investigation`, `validation`,
+   `narration`, `out_of_scope`).
+4. **For the `pipeline` route**, Discovery → Investigation → Validator
+   run sequentially, each one's `raw_text` threaded into the next as
+   context. Narrative runs in **paraphrase mode** over the three
+   structured outputs. `build_final_brief` then templates the brief
+   deterministically and slots the paraphrase into the `summary` field.
+5. **Inside each specialist**, a `BufferedBus` is set on a contextvar
+   so the Strands `@tool` wrappers (`tools/_wrap.py`) push math-tool
+   cards and audit blobs into it as the agent reasons. The wrappers
+   call into the deterministic **math layer** (`hhi`, `cr_n`, `gini`,
+   `sole_source_rate`, `incumbency_streak`, `vendor_footprint`,
+   `cross_dataset_lookup`, …), which hits Postgres through one
+   read-only `psycopg2` helper. Nothing else reaches the DB on the
+   agent path.
+6. **After each agent finishes**, the bus is dumped into the SQLite
+   job record *and* published onto the per-job queue. The SSE
+   consumer drains both: persisted history first, then live tail
+   until the orchestrator emits its terminal `status` event.
+7. **Scheduled scans** call the exact same `run_job` with
+   `scheduled=True`; on a Final Brief whose `metrics_table` carries
+   an HHI > 2500, `_maybe_notify` writes a row into the SQLite
+   `notifications` table, which the navbar bell polls every 30 s.
+
+The math layer is the trust boundary. Every tool returns a `MathResult`
+record (`value`, `sql`, `source_rows`, `trace_steps`, `formula_id`,
+`references`) — agents reason about which tools to call, the tools
+compute the numbers, the deterministic templater composes the brief.
+**Agents never invent a figure.**
+
+## Caching
+
+Four cache layers operate independently in front of the things that are
+slow: the LLM (Ollama Cloud), Postgres, and cold containers. Hits at
+each layer are answered from progressively cheaper sources.
+
+| # | Cache | Where it lives | TTL | Survives | Used by |
+|---|---|---|---|---|---|
+| 1 | **Prompt cache** | in-process dict, `server.py` | 1 h (256 entries, LRU on overflow) | not container restarts (lookup falls back to SQLite job state on miss) | `POST /chat` — re-asking the same `(message, context)` returns the prior `job_id` |
+| 2 | **Dashboard L1** | in-process dict, `dashboards.cached_dashboard` | 1 h | not container restarts | every `/dashboard/*` endpoint |
+| 3 | **Dashboard L2** | SQLite `dashboard_cache` table on the Modal Volume | 1 h | rolling deploys + container restarts | every `/dashboard/*` endpoint |
+| 4 | **Browser cache** | `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` | 1 h fresh, 24 h SWR | any browser reload | every `/dashboard/*` response |
+| — | **Lifespan pre-warm** | `server._prewarm_dashboards()` | one-shot on container boot | n/a | populates L1 (which can be served from L2 on a warm Volume), so the first user after a deploy doesn't pay Postgres latency |
+
+Read order on `/dashboard/*`: **browser → L1 → L2 → Postgres**. Writes
+populate both L1 and L2. The prompt cache is independent — it points
+at the SQLite `jobs` row, which is the actual answer store.
+
+### Job and notification TTLs
+
+Not strictly caches, but related — the SQLite store enforces TTLs on
+expensive rows so the Volume stays small:
+
+- `jobs` — 24 h (`sweep_expired_jobs()` runs opportunistically off
+  read paths, no separate cron).
+- `notifications` — 7 days (filtered at read time in
+  `list_notifications`).
+
+### Why each layer exists
+
+- **Prompt cache** — judges asking the same demo question twice should
+  see the second answer instantly without spending another LLM call.
+  Keyed by SHA-256, so context-sensitive (same question with different
+  prior context is a miss).
+- **Dashboard L1** — heavy CTE queries against Render Postgres take
+  hundreds of milliseconds; an in-process dict makes them effectively
+  free for the lifetime of the container.
+- **Dashboard L2** — Modal containers come and go on rolling deploys.
+  Without L2, the first user after every deploy pays the full Postgres
+  latency on every chart. SQLite on the same Volume the jobstore uses
+  keeps the warm state across restarts.
+- **Browser cache** — chart payloads are stable for the day; the
+  browser disk cache means warm reloads don't even hit the backend.
+  `stale-while-revalidate` lets the cached chart render instantly
+  while the new one is fetched in the background.
+- **Pre-warm** — on lifespan startup, every `/dashboard/*` endpoint
+  with default args is called once so L1 is hot before the first
+  user request lands. Per-endpoint failures are logged and ignored
+  so one flaky chart can't block the boot.
 
 ## Layout
 
@@ -252,13 +440,14 @@ the brief always ships with *some* summary.
 ## Auto-scan & notifications
 
 The same agent pipeline that answers user questions also runs
-proactively on an hourly Modal Cron, scanning for high-concentration
-categories without being asked.
+proactively on a weekly Modal Cron, scanning for high-concentration
+categories without being asked. (The cadence is a temporary cost
+control — see the Modal Cron bullet above.)
 
 ### Flow
 
 ```
-Modal Cron (0 * * * *)
+Modal Cron (0 0 * * 1, Mon 00:00 UTC)
        │
        ▼
 scheduled_scan function

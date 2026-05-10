@@ -7,6 +7,18 @@
 >
 > All implementation choices below are load-bearing. Do not deviate without
 > updating this file first.
+>
+> **Note on the deployment substrate (`deploy` branch).** The agent
+> design described here — Router → D → I → V → N → Final Brief, the
+> deterministic math layer, the references registry, the validator
+> gates — is what runs in production. The hosting choice has moved
+> off AWS: the agent runtime is now Modal (`asgi_app` wrapping the
+> FastAPI server) with the LLM served by Ollama Cloud
+> (`gemma4:31b-cloud`) rather than Bedrock. The diagram below was
+> drawn for the AWS Bedrock + AgentCore deployment; treat the
+> "BACKEND" block as describing the agent topology, not the literal
+> hosting. See `README.md` and `docs/free-tier-redeploy.md` for the
+> as-shipped deployment topology.
 
 ---
 
@@ -190,7 +202,9 @@ NARRATIVE — "Tell me the story. Show me the picture."
    ─ cites every number back to a tool_call_id
 ```
 
-The agent layer is Strands SDK on AWS Bedrock (Claude Sonnet 4). Agents
+The agent layer is Strands SDK with a swappable model provider — Ollama
+Cloud `gemma4:31b-cloud` on the live `deploy` branch, AWS Bedrock
+`us.anthropic.claude-sonnet-4-6` on the legacy AWS variant. Agents
 **reason about which tools to call**; tools compute deterministic numbers.
 Agents never produce a number that did not come back from a tool result.
 
@@ -409,5 +423,5 @@ hackathon-agency-2026/
 | Sunburst, heatmap, complex charts | "Pretty over substance" warned against; sortable tables and bar charts are auditable |
 | Pre-written policy references "from memory" | Hallucination risk; references are fetched live, validated by `build_references.py`, or the claim is dropped |
 | Eval-vs-Validator architectural split | Over-engineered; one pytest harness + Validator gates is enough |
-| Three-cloud demo (AWS + GCP + Azure) | 6 hours; pick AWS (we already learned Bedrock + Strands + AgentCore in v3.x) |
+| Three-cloud demo (AWS + GCP + Azure) | 6 hours; the v3.x plan was to pick AWS (Bedrock + Strands + AgentCore). The shipped `deploy` branch swapped that for Modal + Ollama Cloud once the AWS port was working — same agent design, free-tier substrate. |
 | 30+ source files | Client said v3.x structure was too confusing; ≤10 source files in agent + web |

@@ -7,6 +7,24 @@ few infrastructure-coupled code paths change; the agent design (Router →
 specialists → deterministic Final Brief, math layer, references) is
 untouched.
 
+> **Status (2026-05-10):** the migration is shipped on the `deploy`
+> branch and live in production. The plan below is preserved as a
+> reference for the AWS → free-tier diff. Diffs from the original plan:
+>
+> - Auto-scan cron landed on **weekly** (`0 0 * * 1`, Mon 00:00 UTC)
+>   instead of hourly — temporary cost control; the schedule string
+>   lives in `backend/modal_deploy.py`.
+> - The Modal entrypoint shipped as `backend/modal_deploy.py` (not
+>   `modal_app.py` — same shape).
+> - Added an L2 dashboard response cache (SQLite on the same Volume)
+>   plus a lifespan pre-warm so cold containers don't hit Postgres on
+>   first user request. This is on top of the L1 in-process dict
+>   already present in `dashboards.py`.
+> - `terraform/` and the Lambda-shaped folders (`backend/orchestrator/`,
+>   `backend/{discovery,investigation,validator,narrative}_agent/`,
+>   `backend/scheduler/`, `backend/scan_scheduler/`) are left in place
+>   as archived reference, not deleted.
+
 ## Target stack
 
 | Concern | Current (AWS) | Target (free tier) |
@@ -78,8 +96,9 @@ narrative agent) still hold or are gracefully no-ops.
 
 ## Auto-scan & notifications
 
-Modal scheduled function (`@app.function(schedule=modal.Cron("0 * * * *"))`)
-runs hourly, calls the same in-process orchestrator with the synthetic
+Modal scheduled function (`@app.function(schedule=modal.Cron("0 0 * * 1"))`)
+runs weekly (planned hourly; throttled to weekly post-launch as a cost
+control), calls the same in-process orchestrator with the synthetic
 "find high-HHI categories" prompt, and writes to the `notifications`
 SQLite table when HHI > 2500. Frontend bell polling is unchanged
 (SSE is for chat only, not notifications).
