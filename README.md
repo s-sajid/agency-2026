@@ -153,8 +153,8 @@ flowchart TB
     Job --> Router
     Router -- "pipeline route" --> D
     Router -. "single route" .-> I
-    Router -. .-> V
-    Router -. .-> N
+    Router -.-> V
+    Router -.-> N
     D --> I --> V --> N --> FB
 
     Router <-- "LLM" --> Ollama
