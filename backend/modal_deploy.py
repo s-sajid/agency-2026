@@ -68,7 +68,7 @@ def web():
 @app.function(
     volumes={"/data": volume},
     timeout=900,
-    schedule=modal.Cron("0 * * * *"),  # hourly
+    schedule=modal.Cron("0 0 * * 1"),  # weekly, Mon 00:00 UTC (temp — cost reduction)
 )
 async def scheduled_scan():
     """Hourly auto-scan: enqueue a synthetic 'find high-HHI categories'
