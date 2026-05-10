@@ -40,12 +40,41 @@ def _conn() -> Iterator[psycopg2.extensions.connection]:
         conn.close()
 
 
+def _fix_mojibake(value: Any) -> Any:
+    """Recover UTF-8 bytes that were ingested as Windows-1252.
+
+    Some source CSVs in the dataset contain en-dashes / curly quotes that
+    landed in Postgres as the classic `â€"` / `â€™` / `Â` sequences.
+    Re-encoding as Windows-1252 (cp1252, a Latin-1 superset that also
+    covers the Microsoft 0x80–0x9F range — €, ™, œ, …) and decoding as
+    UTF-8 round-trips them back to the intended characters.
+
+    We only attempt this when the telltale bytes appear, and silently
+    no-op if the round-trip fails (i.e. the string was already clean
+    or is genuinely something else), which makes the call idempotent
+    on already-correct text.
+    """
+    if not isinstance(value, str):
+        return value
+    if "â€" not in value and "Â" not in value:
+        return value
+    try:
+        return value.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
 def query(sql: str, params: tuple | dict | None = None) -> list[dict[str, Any]]:
-    """Run a SELECT and return rows as dicts."""
+    """Run a SELECT and return rows as dicts. String values are run
+    through `_fix_mojibake` to recover ingestion-time UTF-8 corruption.
+    """
     with _conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return [dict(r) for r in cur.fetchall()]
+            return [
+                {k: _fix_mojibake(v) for k, v in row.items()}
+                for row in cur.fetchall()
+            ]
 
 
 def scalar(sql: str, params: tuple | dict | None = None) -> Any:
