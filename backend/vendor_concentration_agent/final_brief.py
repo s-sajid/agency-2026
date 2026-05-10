@@ -310,6 +310,9 @@ def build_final_brief(
     canonical = (verdict.get("cross_dataset") or {}).get("canonical_name")
     entity = canonical or _extract_entity_from_headline(headline)
 
+    candidates = plan.get("candidates") or []
+    category = (candidates[0].get("category") if candidates else None) or plan.get("scope")
+
     return {
         "headline": headline,
         "summary": summary,
@@ -320,4 +323,39 @@ def build_final_brief(
         "recommendation": _recommendation(findings, verdict),
         "caveats": _caveats(findings, verdict, plan),
         "entity": entity,
+        "category": category,
+        "cross_checks": _cross_checks(verdict),
     }
+
+
+def _cross_checks(verdict: dict) -> list[dict]:
+    """Flatten Validator's structured cross-checks into a uniform
+    `{ok, what}` list the dossier modal can render. Sources, in order:
+      1. `checks_run`  — explicit re-computations on a different scope
+      2. `cross_dataset.appears_in` — vendor confirmed in another jurisdiction
+      3. `ruled_out`   — by-design singletons the Validator considered and dismissed
+    """
+    out: list[dict] = []
+    for c in (verdict.get("checks_run") or [])[:3]:
+        what = str(c.get("what") or "").strip()
+        if not what:
+            continue
+        v = (c.get("verdict") or "").upper()
+        out.append({"ok": v == "MATCH", "what": what})
+
+    xd = verdict.get("cross_dataset") or {}
+    appears_in = xd.get("appears_in") or []
+    canonical = xd.get("canonical_name")
+    if appears_in and canonical:
+        out.append({
+            "ok": True,
+            "what": (f"Cross-jurisdiction lookup confirms {canonical} "
+                     f"in {', '.join(appears_in)}."),
+        })
+
+    for r in (verdict.get("ruled_out") or [])[:2]:
+        text = str(r).strip()
+        if text:
+            out.append({"ok": False, "what": f"Ruled out: {text}"})
+
+    return out[:5]

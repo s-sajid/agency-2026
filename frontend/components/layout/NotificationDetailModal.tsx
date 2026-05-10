@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo } from 'react'
+import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import {
   X,
@@ -9,81 +9,14 @@ import {
   Database,
   Hash,
   Clock,
-  TrendingUp,
+  Info,
 } from 'lucide-react'
 
-import type { Notification, NotificationHit } from '@/lib/api'
+import type { Notification, NotificationHit, NotificationMetricRow } from '@/lib/api'
 
 interface NotificationDetailModalProps {
   notification: Notification | null
   onClose: () => void
-}
-
-/**
- * Dummy enrichment payload — in production these fields would come from
- * the source job's audit{} blob, the Validator's cross-check output, and
- * a small "what changed since last scan" diff against the previous
- * notifications row for the same category.
- *
- * For now we synthesise plausible values that round-trip cleanly through
- * the modal's UI so the case-dossier layout reads end-to-end.
- */
-function enrich(n: Notification) {
-  // Pull a deterministic-ish set of dummy details keyed off the
-  // notification id so the same row always shows the same details
-  // (avoids a flicker if the polling refreshes the list while the
-  // modal is open).
-  const seed = (n.notification_id || '').split('-')[0] ?? '0000'
-  const seedNum = parseInt(seed, 16) || 0
-  const vendors = [
-    'IBM Canada Ltd.',
-    'Deloitte Inc.',
-    'Accenture Inc.',
-    'CGI Group Inc.',
-    'KPMG LLP',
-    'Microsoft Canada Co.',
-    'Amazon Web Services Canada',
-  ]
-  const ministries = [
-    'Service Alberta',
-    'Treasury Board and Finance',
-    'Technology and Innovation',
-    'Children\'s Services',
-    'Health',
-  ]
-  const v = vendors[seedNum % vendors.length]
-  const m = ministries[(seedNum >> 4) % ministries.length]
-  const tenureYears = 3 + (seedNum % 6)
-  const sharePct = 70 + ((seedNum >> 2) % 28)
-
-  // 4-quarter HHI trend ending at the most-recent hit's value
-  const headlineHhi = (n.hits?.[0]?.value as number) || 4000
-  const trend = [
-    { fy: 'FY20/21', hhi: Math.max(1500, Math.round(headlineHhi - 1300 + (seedNum % 200))) },
-    { fy: 'FY21/22', hhi: Math.max(1700, Math.round(headlineHhi - 900 + (seedNum % 200))) },
-    { fy: 'FY22/23', hhi: Math.max(2000, Math.round(headlineHhi - 400 + (seedNum % 200))) },
-    { fy: 'FY23/24', hhi: Math.round(headlineHhi) },
-  ]
-
-  return {
-    dominantVendor: v,
-    dominantMinistry: m,
-    sharePct,
-    tenureYears,
-    crossChecks: [
-      { ok: true,  what: `Cross-checked against sibling table ab.ab_sole_source — vendor share within ±2 pp.` },
-      { ok: true,  what: `Cross-jurisdiction lookup confirms ${v} contracts in Alberta and Federal procurement.` },
-      { ok: false, what: `Single-supplier exemption claim on file (DOJ §C — by-design singleton ruled out).` },
-    ],
-    trend,
-    recommendedAction:
-      'Treat as candidate for procurement review. Schedule competitive re-tender ahead of the FY25/26 cycle and request a written justification for any continued sole-source extension.',
-    similar: [
-      { name: 'IT consulting · British Columbia', hhi: 4012 },
-      { name: 'Cloud infrastructure · Federal',  hhi: 5210 },
-      { name: 'Records management · Ontario',     hhi: 3470 },
-    ],
-  }
 }
 
 function fmtTimestamp(iso?: string): string {
@@ -113,76 +46,19 @@ function shortId(id?: string): string {
   return id.slice(0, 8).toUpperCase()
 }
 
-// Tiny inline SVG sparkline. Draws in on mount via stroke-dasharray.
-function Sparkline({
-  values,
-  color,
-  height = 32,
-}: {
-  values: number[]
-  color: string
-  height?: number
-}) {
-  const points = useMemo(() => {
-    if (values.length === 0) return ''
-    const max = Math.max(...values)
-    const min = Math.min(...values)
-    const range = max - min || 1
-    const w = 120
-    const h = height - 8
-    return values
-      .map((v, i) => {
-        const x = (i / (values.length - 1)) * w
-        const y = h - ((v - min) / range) * h + 4
-        return `${x.toFixed(1)},${y.toFixed(1)}`
-      })
-      .join(' ')
-  }, [values, height])
-
-  return (
-    <svg width="120" height={height} className="overflow-visible">
-      <style>{`
-        @keyframes spark-draw {
-          from { stroke-dashoffset: 200; }
-          to   { stroke-dashoffset: 0; }
-        }
-        .spark-line {
-          stroke-dasharray: 200;
-          animation: spark-draw 1.1s cubic-bezier(0.22,1,0.36,1) forwards;
-        }
-        @keyframes spark-dot {
-          0%   { transform: scale(0); opacity: 0; }
-          100% { transform: scale(1); opacity: 1; }
-        }
-        .spark-dot { animation: spark-dot 0.4s ease-out 0.9s forwards; opacity: 0; transform-origin: center; }
-      `}</style>
-      <polyline
-        className="spark-line"
-        points={points}
-        fill="none"
-        stroke={color}
-        strokeWidth="1.75"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      {values.map((_, i) => {
-        if (i !== values.length - 1) return null
-        const [x, y] = points.split(' ').slice(-1)[0].split(',').map(Number)
-        return (
-          <circle
-            key={i}
-            className="spark-dot"
-            cx={x}
-            cy={y}
-            r="3"
-            fill={color}
-            stroke="hsl(var(--card))"
-            strokeWidth="1.5"
-          />
-        )
-      })}
-    </svg>
-  )
+// Pull a metric row out of the persisted metrics_table by case-insensitive
+// name match. Returns the row's already-formatted display value, or null.
+function findMetric(
+  rows: NotificationMetricRow[] | undefined,
+  ...names: string[]
+): NotificationMetricRow | null {
+  if (!rows) return null
+  const lowered = names.map((n) => n.toLowerCase())
+  for (const r of rows) {
+    const m = (r.metric || '').toLowerCase()
+    if (lowered.some((n) => m === n || m.includes(n))) return r
+  }
+  return null
 }
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -218,10 +94,18 @@ export function NotificationDetailModal({
 
   if (!notification) return null
 
-  const dummy = enrich(notification)
   const vColor = verdictColor(notification.verdict)
   const hits: NotificationHit[] = notification.hits ?? []
   const headlineHit = hits[0]
+  const metricsTable = notification.metrics_table ?? []
+  const crossChecks = notification.cross_checks ?? []
+  const caveats = notification.caveats ?? []
+
+  // Derive secondary panel fields from the persisted metrics_table — the
+  // values are pre-formatted strings ("100.0%", "1") composed by the
+  // Final Brief, so we render them verbatim.
+  const shareRow = findMetric(metricsTable, 'CR_1', 'CR1', 'cr_1')
+  const tenureRow = findMetric(metricsTable, 'incumbency_streak', 'incumbency')
 
   return createPortal(
     <div
@@ -300,8 +184,7 @@ export function NotificationDetailModal({
             className="text-[19px] font-bold tracking-tight leading-snug text-foreground"
             style={{ fontFamily: 'var(--font-syne)' }}
           >
-            {notification.headline ||
-              `Auto-scan flagged a high-concentration category in ${dummy.dominantMinistry}`}
+            {notification.headline || 'Auto-scan flagged a high-concentration category.'}
           </h2>
 
           {/* Metadata strip */}
@@ -314,10 +197,12 @@ export function NotificationDetailModal({
               <Hash className="h-2.5 w-2.5" />
               job: {shortId(notification.source_job_id)}
             </span>
-            <span className="flex items-center gap-1.5">
-              <Database className="h-2.5 w-2.5" />
-              ab.ab_contracts
-            </span>
+            {notification.entity && (
+              <span className="flex items-center gap-1.5">
+                <Database className="h-2.5 w-2.5" />
+                {notification.entity}
+              </span>
+            )}
           </div>
 
           {/* Pills */}
@@ -385,82 +270,79 @@ export function NotificationDetailModal({
           <section>
             <SectionLabel>Primary finding</SectionLabel>
             <div
-              className="rounded-lg border p-4 grid grid-cols-[1fr_auto] gap-4"
+              className="rounded-lg border p-4"
               style={{
                 borderColor: `color-mix(in srgb, ${vColor} 30%, transparent)`,
                 background: `color-mix(in srgb, ${vColor} 4%, transparent)`,
               }}
             >
-              <div className="min-w-0">
-                <div className="flex items-baseline gap-3 mb-1">
-                  <span
-                    className="text-[10px] font-bold uppercase tracking-[0.18em]"
-                    style={{ color: vColor }}
-                  >
-                    {headlineHit?.metric ?? 'HHI'}
-                  </span>
-                  <span
-                    className="text-[26px] font-bold tabular-nums leading-none text-foreground"
-                    style={{ fontFamily: 'var(--font-syne)' }}
-                  >
-                    {fmtNumber(Math.round(Number(headlineHit?.value ?? 4231)))}
-                  </span>
-                </div>
-                {headlineHit?.interpretation && (
-                  <p className="text-[11px] text-muted-foreground italic mb-3">
-                    {headlineHit.interpretation}
-                  </p>
-                )}
+              <div className="flex items-baseline gap-3 mb-1">
+                <span
+                  className="text-[10px] font-bold uppercase tracking-[0.18em]"
+                  style={{ color: vColor }}
+                >
+                  {headlineHit?.metric ?? 'HHI'}
+                </span>
+                <span
+                  className="text-[26px] font-bold tabular-nums leading-none text-foreground"
+                  style={{ fontFamily: 'var(--font-syne)' }}
+                >
+                  {fmtNumber(Math.round(Number(headlineHit?.value ?? 0)))}
+                </span>
+              </div>
+              {headlineHit?.interpretation && (
+                <p className="text-[11px] text-muted-foreground italic mb-3">
+                  {headlineHit.interpretation}
+                </p>
+              )}
 
-                <dl className="grid grid-cols-2 gap-x-5 gap-y-2 text-[11.5px]">
+              <dl className="grid grid-cols-2 gap-x-5 gap-y-2 text-[11.5px]">
+                {notification.entity && (
                   <div>
                     <dt className="text-[9.5px] font-bold uppercase tracking-[0.16em] text-muted-foreground/70 mb-0.5">
                       Dominant vendor
                     </dt>
-                    <dd className="text-foreground font-medium truncate">
-                      {dummy.dominantVendor}
+                    <dd className="text-foreground font-medium truncate" title={notification.entity}>
+                      {notification.entity}
                     </dd>
                   </div>
+                )}
+                {notification.category && (
                   <div>
                     <dt className="text-[9.5px] font-bold uppercase tracking-[0.16em] text-muted-foreground/70 mb-0.5">
-                      Ministry
+                      Category
                     </dt>
-                    <dd className="text-foreground font-medium truncate">
-                      {dummy.dominantMinistry}
+                    <dd className="text-foreground font-medium truncate" title={notification.category}>
+                      {notification.category}
                     </dd>
                   </div>
+                )}
+                {shareRow && (
                   <div>
                     <dt className="text-[9.5px] font-bold uppercase tracking-[0.16em] text-muted-foreground/70 mb-0.5">
-                      Share of spend
+                      Share of spend (CR_1)
                     </dt>
                     <dd className="text-foreground font-mono tabular-nums">
-                      {dummy.sharePct.toFixed(1)}%
+                      {shareRow.value}
                     </dd>
                   </div>
+                )}
+                {tenureRow && (
                   <div>
                     <dt className="text-[9.5px] font-bold uppercase tracking-[0.16em] text-muted-foreground/70 mb-0.5">
                       Tenure
                     </dt>
                     <dd className="text-foreground font-mono tabular-nums">
-                      {dummy.tenureYears}{' '}
-                      <span className="text-muted-foreground">consecutive FYs</span>
+                      {tenureRow.value}{' '}
+                      {tenureRow.interpretation && (
+                        <span className="text-muted-foreground">
+                          · {tenureRow.interpretation}
+                        </span>
+                      )}
                     </dd>
                   </div>
-                </dl>
-              </div>
-
-              {/* Sparkline */}
-              <div className="flex flex-col items-end justify-between min-w-[120px]">
-                <span className="flex items-center gap-1 text-[9px] font-bold uppercase tracking-[0.18em] text-muted-foreground/70">
-                  <TrendingUp className="h-2.5 w-2.5" />
-                  4-yr trend
-                </span>
-                <Sparkline values={dummy.trend.map((t) => t.hhi)} color={vColor} />
-                <div className="flex w-[120px] justify-between text-[8.5px] font-mono text-muted-foreground/60 tabular-nums">
-                  <span>{dummy.trend[0].fy}</span>
-                  <span>{dummy.trend[dummy.trend.length - 1].fy}</span>
-                </div>
-              </div>
+                )}
+              </dl>
             </div>
 
             {/* Additional hits collapsed below */}
@@ -485,62 +367,90 @@ export function NotificationDetailModal({
             )}
           </section>
 
+          {/* METRICS TABLE — full deterministic-math output */}
+          {metricsTable.length > 0 && (
+            <section>
+              <SectionLabel>All metrics computed</SectionLabel>
+              <ul className="divide-y divide-border/50 border border-border rounded-md overflow-hidden">
+                {metricsTable.map((m, i) => (
+                  <li
+                    key={i}
+                    className="grid grid-cols-[auto_1fr_auto] items-center gap-3 px-3 py-2"
+                  >
+                    <span className="text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground/80">
+                      {m.metric}
+                    </span>
+                    <span className="text-[10.5px] italic text-muted-foreground truncate">
+                      {m.interpretation || ''}
+                    </span>
+                    <span className="text-[12px] font-mono font-semibold tabular-nums text-foreground">
+                      {m.value}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {/* CROSS-CHECKS */}
-          <section>
-            <SectionLabel>Cross-checks</SectionLabel>
-            <ul className="space-y-1.5">
-              {dummy.crossChecks.map((c, i) => (
-                <li key={i} className="flex items-start gap-2 text-[12px] leading-relaxed">
-                  {c.ok ? (
-                    <ShieldCheck
-                      className="h-3.5 w-3.5 mt-0.5 shrink-0"
-                      style={{ color: 'hsl(var(--chart-3))' }}
+          {crossChecks.length > 0 && (
+            <section>
+              <SectionLabel>Cross-checks</SectionLabel>
+              <ul className="space-y-1.5">
+                {crossChecks.map((c, i) => (
+                  <li key={i} className="flex items-start gap-2 text-[12px] leading-relaxed">
+                    {c.ok ? (
+                      <ShieldCheck
+                        className="h-3.5 w-3.5 mt-0.5 shrink-0"
+                        style={{ color: 'hsl(var(--chart-3))' }}
+                      />
+                    ) : (
+                      <AlertTriangle
+                        className="h-3.5 w-3.5 mt-0.5 shrink-0"
+                        style={{ color: 'hsl(var(--chart-4))' }}
+                      />
+                    )}
+                    <span className="text-foreground/85">{c.what}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {/* CAVEATS */}
+          {caveats.length > 0 && (
+            <section>
+              <SectionLabel>Caveats</SectionLabel>
+              <ul className="space-y-1.5">
+                {caveats.map((c, i) => (
+                  <li key={i} className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+                    <Info
+                      className="h-3 w-3 mt-1 shrink-0 text-muted-foreground/70"
                     />
-                  ) : (
-                    <AlertTriangle
-                      className="h-3.5 w-3.5 mt-0.5 shrink-0"
-                      style={{ color: 'hsl(var(--chart-4))' }}
-                    />
-                  )}
-                  <span className="text-foreground/85">{c.what}</span>
-                </li>
-              ))}
-            </ul>
-          </section>
+                    <span className="text-foreground/80 italic">{c}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           {/* RECOMMENDED ACTION */}
-          <section>
-            <SectionLabel>Recommended action</SectionLabel>
-            <div
-              className="rounded-md p-3.5 border-l-[3px]"
-              style={{
-                borderLeftColor: vColor,
-                background: 'hsl(var(--muted) / 0.4)',
-              }}
-            >
-              <p className="text-[12.5px] text-foreground/90 leading-relaxed">
-                {dummy.recommendedAction}
-              </p>
-            </div>
-          </section>
-
-          {/* SIMILAR */}
-          <section>
-            <SectionLabel>Similar categories elsewhere</SectionLabel>
-            <ul className="space-y-1">
-              {dummy.similar.map((s) => (
-                <li
-                  key={s.name}
-                  className="flex items-center justify-between text-[11.5px] py-1.5 border-b border-border/40 last:border-b-0"
-                >
-                  <span className="text-foreground/85 truncate pr-3">{s.name}</span>
-                  <span className="font-mono tabular-nums text-muted-foreground shrink-0">
-                    HHI {fmtNumber(s.hhi)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
+          {notification.recommendation && (
+            <section>
+              <SectionLabel>Recommended action</SectionLabel>
+              <div
+                className="rounded-md p-3.5 border-l-[3px]"
+                style={{
+                  borderLeftColor: vColor,
+                  background: 'hsl(var(--muted) / 0.4)',
+                }}
+              >
+                <p className="text-[12.5px] text-foreground/90 leading-relaxed">
+                  {notification.recommendation}
+                </p>
+              </div>
+            </section>
+          )}
         </div>
 
         {/* ── Footer ──────────────────────────────────────────────────── */}

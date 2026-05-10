@@ -315,6 +315,18 @@ export interface NotificationHit {
   call_id?: string
 }
 
+export interface NotificationMetricRow {
+  metric: string
+  value: string
+  interpretation?: string
+  call_id?: string | null
+}
+
+export interface NotificationCrossCheck {
+  ok: boolean
+  what: string
+}
+
 export interface Notification {
   notification_id: string
   created_at: string
@@ -326,6 +338,11 @@ export interface Notification {
   confidence?: 'high' | 'medium' | 'low'
   sub_theme?: 'Efficiency' | 'Integrity' | 'Alignment'
   entity?: string
+  category?: string
+  recommendation?: string
+  metrics_table?: NotificationMetricRow[]
+  caveats?: string[]
+  cross_checks?: NotificationCrossCheck[]
   hits: NotificationHit[]
 }
 
