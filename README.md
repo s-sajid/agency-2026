@@ -4,6 +4,11 @@ Hackathon entry for **Challenge 5: Vendor Concentration**. Frontend on
 Vercel, backend on Modal, Ollama Cloud for the LLM, and a read-only
 Postgres for the procurement data.
 
+> Presenting on the original AWS build instead? See
+> **[docs/aws-architecture.md](docs/aws-architecture.md)** — App Runner
+> + SQS + DynamoDB + Lambda + Bedrock + Terraform topology shipped on
+> the `main` branch, with the same agent design as below.
+
 ## Technology stack
 
 | Layer | Technology | Where it lives |

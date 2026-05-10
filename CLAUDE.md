@@ -21,7 +21,9 @@ references, validator gates): `docs/architecture.md` and
 `docs/judges-context.md`. Source of truth for the migration off AWS:
 `docs/free-tier-redeploy.md`. Source of truth for the deployment
 topology (Modal, Vercel, Ollama Cloud, SQLite-on-Volume): the
-`README.md` at the repo root.
+`README.md` at the repo root. Source of truth for the **AWS variant**
+(App Runner + SQS + DynamoDB + Lambda + Bedrock + Terraform, shipped
+on `main`): `docs/aws-architecture.md`.
 
 ## Deployable units (deploy branch)
 
