@@ -127,6 +127,14 @@ def _init_schema(c: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_created_at
             ON notifications(created_at);
+
+        CREATE TABLE IF NOT EXISTS dashboard_cache (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            expires_at  REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_dashboard_cache_expires
+            ON dashboard_cache(expires_at);
     """)
     # Idempotent migrations for DBs created before each column existed.
     cols = {r["name"] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
@@ -322,4 +330,43 @@ def sweep_expired_jobs() -> int:
     """
     cutoff = datetime.fromtimestamp(time.time() - _JOB_TTL_SECONDS, timezone.utc).isoformat()
     cur = _get_conn().execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,))
+    return cur.rowcount or 0
+
+
+# ── Dashboard response cache (L2, persistent across container restarts) ──────
+#
+# The dashboards layer keeps an in-process dict for sub-microsecond hits.
+# This SQLite-backed layer survives restarts and rolling deploys, so the
+# first user after a deploy gets warm responses instead of paying the
+# full Postgres CTE latency. The dashboards decorator uses both layers.
+
+def dashboard_cache_get(key: str) -> Any | None:
+    """Return the JSON-decoded cached value for `key` if its expiry is
+    still in the future; otherwise None. None is also returned if the
+    stored payload fails to JSON-decode (treated as a miss).
+    """
+    row = _get_conn().execute(
+        "SELECT value FROM dashboard_cache WHERE key = ? AND expires_at > ?",
+        (key, time.time()),
+    ).fetchone()
+    return _loads(row["value"], None) if row else None
+
+
+def dashboard_cache_set(key: str, value: Any, ttl_seconds: float) -> None:
+    """Upsert (key, JSON-encoded value, now+ttl). Idempotent — last
+    writer wins, which is fine since two containers computing the same
+    response will produce identical payloads.
+    """
+    _get_conn().execute(
+        "INSERT OR REPLACE INTO dashboard_cache (key, value, expires_at) "
+        "VALUES (?, ?, ?)",
+        (key, _dumps(value), time.time() + float(ttl_seconds)),
+    )
+
+
+def dashboard_cache_sweep() -> int:
+    """Delete expired dashboard_cache rows. Called opportunistically."""
+    cur = _get_conn().execute(
+        "DELETE FROM dashboard_cache WHERE expires_at <= ?", (time.time(),)
+    )
     return cur.rowcount or 0

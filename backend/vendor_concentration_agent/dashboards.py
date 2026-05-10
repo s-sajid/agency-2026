@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import os
 import threading
 import time
@@ -26,7 +27,14 @@ import polars as pl
 from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 
+from vendor_concentration_agent.jobstore import (
+    dashboard_cache_get,
+    dashboard_cache_set,
+)
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Accept either env-var name. agency-prep uses DATABASE_URL; we use PG_DSN.
 _URI = os.environ.get("DATABASE_URL") or os.environ.get("PG_DSN")
@@ -43,29 +51,35 @@ def _query(sql: str) -> pl.DataFrame:
     return pl.read_database_uri(sql, _CX_URI)
 
 
-# ── In-process TTL cache for dashboard responses ──────────────────────────────
+# ── Two-layer TTL cache for dashboard responses ──────────────────────────────
 #
 # Every chart endpoint runs heavy CTE queries against the Render Postgres
-# replica. The data updates daily at most, so caching for a few minutes is
-# safe. First request pays the latency; everything within TTL hits the
-# in-process dict in <1ms.
+# replica. The dataset updates daily at most, so a long TTL is safe.
 #
-# Single-process model (one App Runner instance, default uvicorn worker
-# count). If you ever scale horizontally, each instance keeps its own
-# cache — minor inefficiency, not a correctness issue.
-_DASHBOARD_TTL_SECONDS = 300
+#   L1: in-process dict — sub-microsecond hits, lost on container restart.
+#   L2: SQLite on the vendor-agent Volume — survives rolling deploys and
+#       cold starts so the first user after a deploy doesn't pay full
+#       Postgres latency. Same Volume the job/notification store uses.
+#
+# Read order: L1 → L2 → compute. Writes populate both layers.
+_DASHBOARD_TTL_SECONDS = 3600  # 1 hour — daily-update data, generous
 
 _cache: dict[Any, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
 
 def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
-    """Decorator: cache an async endpoint's return value for `ttl` seconds.
+    """Decorator: cache an async endpoint's return value for `ttl` seconds
+    across both an in-process dict (L1) and the SQLite-on-Volume
+    `dashboard_cache` table (L2).
 
     Cache key includes the function name and resolved arguments (defaults
     applied), so `?limit=5` and `?limit=10` get separate entries while two
     requests with the same `limit` share one. Errors are NOT cached —
     Postgres failures retry on the next request.
+
+    L2 misses (e.g. SQLite/Volume hiccup) downgrade silently to a
+    compute, so a flaky disk never breaks the endpoint.
     """
     def decorator(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
@@ -74,17 +88,36 @@ def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
         async def wrapper(*args, **kwargs):
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
-            key = (fn.__name__, tuple(sorted(bound.arguments.items())))
+            key_tuple = (fn.__name__, tuple(sorted(bound.arguments.items())))
 
             now = time.time()
+
+            # L1
             with _cache_lock:
-                hit = _cache.get(key)
+                hit = _cache.get(key_tuple)
                 if hit and (now - hit[0]) < ttl:
                     return hit[1]
 
+            # L2 — same TTL as L1; the SQL query already filters expired rows
+            key_str = repr(key_tuple)
+            try:
+                disk_value = dashboard_cache_get(key_str)
+            except Exception as e:
+                logger.warning("dashboard_cache_get failed for %s: %s", fn.__name__, e)
+                disk_value = None
+            if disk_value is not None:
+                with _cache_lock:
+                    _cache[key_tuple] = (now, disk_value)
+                return disk_value
+
+            # Compute and populate both layers
             result = await fn(*args, **kwargs)
             with _cache_lock:
-                _cache[key] = (now, result)
+                _cache[key_tuple] = (now, result)
+            try:
+                dashboard_cache_set(key_str, result, ttl)
+            except Exception as e:
+                logger.warning("dashboard_cache_set failed for %s: %s", fn.__name__, e)
             return result
 
         return wrapper
