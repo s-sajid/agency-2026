@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { Bell, AlarmClock, Activity, X, ChevronRight } from 'lucide-react'
 
@@ -89,11 +89,30 @@ export function NotificationsBell() {
     }
   }, [open])
 
+  // Auto-scan re-runs hourly and the same dominant vendor often wins
+  // multiple times in a row, so collapse the list by `entity` (Validator's
+  // canonical_name with a regex headline fallback). Items are returned
+  // newest-first, so keeping the first occurrence per key shows the
+  // freshest finding for each company. Items without an entity fall back
+  // to their notification_id so they always render.
+  const visibleItems = useMemo(() => {
+    if (!items) return items
+    const seen = new Set<string>()
+    const out: Notification[] = []
+    for (const n of items) {
+      const key = (n.entity?.trim().toLowerCase()) || n.notification_id
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(n)
+    }
+    return out
+  }, [items])
+
   const unreadCount = (() => {
-    if (!items || items.length === 0) return 0
-    if (!lastSeenAt) return items.length
+    if (!visibleItems || visibleItems.length === 0) return 0
+    if (!lastSeenAt) return visibleItems.length
     const last = new Date(lastSeenAt).getTime()
-    return items.filter((i) => new Date(i.created_at).getTime() > last).length
+    return visibleItems.filter((i) => new Date(i.created_at).getTime() > last).length
   })()
 
   function markRead() {
@@ -214,7 +233,7 @@ export function NotificationsBell() {
 
           {/* ── List ── */}
           <div className="max-h-[420px] overflow-y-auto overscroll-contain">
-            {items === null && (
+            {visibleItems === null && (
               <div className="px-4 py-8 text-center">
                 <div className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
                   <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60 animate-pulse" />
@@ -223,7 +242,7 @@ export function NotificationsBell() {
               </div>
             )}
 
-            {items !== null && items.length === 0 && (
+            {visibleItems !== null && visibleItems.length === 0 && (
               <div className="px-4 py-8 text-center">
                 <div className="inline-flex flex-col items-center gap-2">
                   <Activity
@@ -238,7 +257,7 @@ export function NotificationsBell() {
               </div>
             )}
 
-            {items?.map((n) => {
+            {visibleItems?.map((n) => {
               const isUnread =
                 lastSeenAt === null ||
                 new Date(n.created_at).getTime() > new Date(lastSeenAt).getTime()
