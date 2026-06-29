@@ -1,8 +1,8 @@
 # Vendor Concentration — Agency 2026
 
 Hackathon entry for **Challenge 5: Vendor Concentration**. Frontend on
-Vercel, backend on Modal, Ollama Cloud for the LLM, and local April
-hackathon JSONL files for the procurement data.
+Vercel, backend on Modal, Ollama Cloud for the LLM, and a read-only
+Postgres for the procurement data.
 
 > Presenting on the original AWS build instead? See
 > **[docs/aws-architecture.md](docs/aws-architecture.md)** — App Runner
@@ -26,8 +26,8 @@ hackathon JSONL files for the procurement data.
 | LLM (default) | Ollama Cloud — `gemma4:31b-cloud` | `LLM_PROVIDER=ollama` |
 | LLM (legacy) | AWS Bedrock — `us.anthropic.claude-sonnet-4-6` | `LLM_PROVIDER=bedrock` (the AWS-variant path) |
 | Job + notification store | SQLite on a Modal Volume | `vendor_concentration_agent/jobstore.py` |
-| Source data | Local April hackathon JSONL subset | `backend/data/*.jsonl`, `data/local.py` |
-| Legacy Postgres helper | Retained for historical code paths | `data/postgres.py` |
+| Source data | Render-hosted Postgres (read-only replica) | `data/postgres.py` (agent tools), `dashboards.py` (charts) |
+| Postgres clients | `psycopg2` (agent math tools), `connectorx` + `polars` (dashboards) | |
 | Transport | Server-Sent Events | browser `EventSource` ↔ `/chat/stream/:job_id` |
 | IaC | None for `deploy`; archived Terraform retained for the AWS variant | `terraform/` |
 
@@ -208,8 +208,9 @@ flowchart TB
    cards and audit blobs into it as the agent reasons. The wrappers
    call into the deterministic **math layer** (`hhi`, `cr_n`, `gini`,
    `sole_source_rate`, `incumbency_streak`, `vendor_footprint`,
-  `cross_dataset_lookup`, …), which reads through the local data helper.
-   Nothing else reaches into the raw data files on the agent path.
+   `cross_dataset_lookup`, …), which hits Postgres through one
+   read-only `psycopg2` helper. Nothing else reaches the DB on the
+   agent path.
 6. **After each agent finishes**, the bus is dumped into the SQLite
    job record *and* published onto the per-job queue. The SSE
    consumer drains both: persisted history first, then live tail
@@ -228,7 +229,7 @@ compute the numbers, the deterministic templater composes the brief.
 ## Caching
 
 Four cache layers operate independently in front of the things that are
-slow: the LLM (Ollama Cloud), local aggregations, and cold containers. Hits at
+slow: the LLM (Ollama Cloud), Postgres, and cold containers. Hits at
 each layer are answered from progressively cheaper sources.
 
 | # | Cache | Where it lives | TTL | Survives | Used by |
@@ -237,9 +238,9 @@ each layer are answered from progressively cheaper sources.
 | 2 | **Dashboard L1** | in-process dict, `dashboards.cached_dashboard` | 1 h | not container restarts | every `/dashboard/*` endpoint |
 | 3 | **Dashboard L2** | SQLite `dashboard_cache` table on the Modal Volume | 1 h | rolling deploys + container restarts | every `/dashboard/*` endpoint |
 | 4 | **Browser cache** | `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` | 1 h fresh, 24 h SWR | any browser reload | every `/dashboard/*` response |
-| — | **Lifespan pre-warm** | `server._prewarm_dashboards()` | one-shot on container boot | n/a | populates L1 (which can be served from L2 on a warm Volume), so the first user after a deploy doesn't pay local aggregation cost |
+| — | **Lifespan pre-warm** | `server._prewarm_dashboards()` | one-shot on container boot | n/a | populates L1 (which can be served from L2 on a warm Volume), so the first user after a deploy doesn't pay Postgres latency |
 
-Read order on `/dashboard/*`: **browser → L1 → L2 → local JSONL aggregation**. Writes
+Read order on `/dashboard/*`: **browser → L1 → L2 → Postgres**. Writes
 populate both L1 and L2. The prompt cache is independent — it points
 at the SQLite `jobs` row, which is the actual answer store.
 
@@ -259,13 +260,13 @@ expensive rows so the Volume stays small:
   see the second answer instantly without spending another LLM call.
   Keyed by SHA-256, so context-sensitive (same question with different
   prior context is a miss).
-- **Dashboard L1** — local aggregations still have non-zero cold-start
-  cost; an in-process dict makes them effectively free for the lifetime
-  of the container.
+- **Dashboard L1** — heavy CTE queries against Render Postgres take
+  hundreds of milliseconds; an in-process dict makes them effectively
+  free for the lifetime of the container.
 - **Dashboard L2** — Modal containers come and go on rolling deploys.
-  Without L2, the first user after every deploy recomputes every chart.
-  SQLite on the same Volume the jobstore uses keeps the warm state
-  across restarts.
+  Without L2, the first user after every deploy pays the full Postgres
+  latency on every chart. SQLite on the same Volume the jobstore uses
+  keeps the warm state across restarts.
 - **Browser cache** — chart payloads are stable for the day; the
   browser disk cache means warm reloads don't even hit the backend.
   `stale-while-revalidate` lets the cached chart render instantly
@@ -389,8 +390,8 @@ that returns a `MathResult`:
 | `math/crosscheck.py` | `cross_dataset_lookup(entity)` | Same entity totals across AB / FED / open.canada.ca via `general.entity_match` | — |
 | `math/crosscheck.py` | `divergence_check(a, b)` | Δ% between two computations of "same" number | Pure arithmetic |
 
-Local dataset access is funnelled through
-`vendor_concentration_agent/data/local.py`; no agent or tool reaches
+Postgres access is funnelled through one read-only helper
+(`vendor_concentration_agent/data/postgres.py`); no agent or tool reaches
 around it. **No invented metrics** — no `lockin_score`, no custom risk
 indices. If a formula isn't in a textbook, government policy doc, or
 standard methodology page, it doesn't ship.
@@ -546,7 +547,7 @@ typically fan out to one or more of:
 
 ```bash
 # Backend
-cp .env.example .env   # set OLLAMA_CLOUD_API_KEY; PG_DSN is not needed for the demo data path
+cp .env.example .env   # set OLLAMA_CLOUD_API_KEY and PG_DSN
 cd backend
 uv sync
 uv run uvicorn server:app --reload --port 8000
@@ -560,9 +561,7 @@ NEXT_PUBLIC_BACKEND_URL=http://localhost:8000 pnpm dev
 
 The local backend uses the same SQLite store (file at
 `backend/vendor_agent.db`, gitignored). The chat path runs end-to-end
-locally as long as `OLLAMA_CLOUD_API_KEY` is set. The dashboard and math
-tools read the committed demo subset from `backend/data`; set
-`LOCAL_DATA_DIR` only if you want to override that location.
+locally as long as `OLLAMA_CLOUD_API_KEY` and `PG_DSN` are set.
 
 ## Deploy
 
@@ -580,6 +579,7 @@ uv run modal secret create vendor-agent \
     LLM_MODEL=gemma4:31b-cloud \
     OLLAMA_HOST=https://ollama.com \
     OLLAMA_CLOUD_API_KEY=... \
+    PG_DSN='postgresql://...' \
     CORS_ORIGINS='https://your-app.vercel.app'
 
 # Deploy
