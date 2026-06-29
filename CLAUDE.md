@@ -96,10 +96,10 @@ or `backend/vendor_agent.db` locally. Three tables:
 - `notifications` — high-HHI hits from scheduled scans (7-day TTL).
 - `dashboard_cache` — L2 cache for the dashboard endpoints, survives
   rolling deploys. The dashboards decorator (`cached_dashboard` in
-  `dashboards.py`) reads L1 (in-process dict) → L2 (SQLite) → Postgres.
+  `dashboards.py`) reads L1 (in-process dict) → L2 (SQLite) → local JSONL.
 
 `server.py` runs `_prewarm_dashboards()` on lifespan startup so the
-first user after a cold container boot doesn't pay full Postgres latency.
+first user after a cold container boot doesn't pay local aggregation cost.
 
 ## Auto-scan
 
@@ -128,8 +128,9 @@ cd backend && uv run modal run modal_deploy.py::scheduled_scan
 ```
 
 Single `.env` at the repo root; copy `.env.example`. The deploy stack
-needs `OLLAMA_CLOUD_API_KEY` + `PG_DSN`; Modal reads the rest from a
-secret named `vendor-agent`.
+needs `OLLAMA_CLOUD_API_KEY`; Modal reads the rest from a secret named
+`vendor-agent`. The demo data path uses `backend/data/*.jsonl`, not
+`PG_DSN`.
 
 ## LLM provider
 
@@ -150,11 +151,10 @@ retained so the AWS variant still works.
   `tool_result`). The transport (SSE vs polling) is decoupled from the
   shape — funding-loops' "don't touch this contract" rule applies to
   the shape, not the wire format.
-- Reach into Postgres outside
-  `backend/vendor_concentration_agent/data/postgres.py` or
-  `dashboards.py` (which uses its own `connectorx` URI for polars-shape
-  dashboard reads). All non-dashboard DB access goes through the one
-  read-only `psycopg2` helper.
+- Reach into raw data files outside
+  `backend/vendor_concentration_agent/data/local.py`. Dashboard and
+  deterministic math access should go through the local data helper so
+  the demo branch remains independent of the retired Postgres replica.
 - Use `npm` or `pip` for new code in this repo. Frontend uses `pnpm`,
   every Python project uses `uv` with its own `pyproject.toml`.
 - Edit `frontend/` without reading `node_modules/next/dist/docs/` first —

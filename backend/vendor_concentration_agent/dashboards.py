@@ -1,86 +1,36 @@
-"""Read-only dashboard endpoints — vendored from agency-prep/backend/api.py.
-
-These power the homepage charts (`MetricsSummary`, `TopVendorsChart`,
-`ConcentrationChart`, `ConcentrationScatterChart`, `VendorDominanceChart`,
-`SpendOverTimeChart`, `ConcentrationTrendChart`, `VendorCompetitionChart`,
-`ThresholdDistributionChart`).
-
-SQL is unchanged from agency-prep — same ministry/recipient normalization
-helpers, same HHI band thresholds (DOJ/FTC), same response shapes the
-frontend's lib/api.ts expects.
-
-Uses connectorx + polars (matches agency-prep's choice). Reads DATABASE_URL
-or PG_DSN — both work, so existing .env files don't need changing.
-"""
+"""Read-only dashboard endpoints backed by the local April JSONL dataset."""
 
 from __future__ import annotations
 
 import functools
 import inspect
 import logging
-import os
 import threading
 import time
+from collections import defaultdict
 from typing import Any, Callable
 
-import polars as pl
-from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 
+from vendor_concentration_agent.data import local
 from vendor_concentration_agent.jobstore import (
     dashboard_cache_get,
     dashboard_cache_set,
 )
 
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-# Accept either env-var name. agency-prep uses DATABASE_URL; we use PG_DSN.
-_URI = os.environ.get("DATABASE_URL") or os.environ.get("PG_DSN")
-if not _URI:
-    raise RuntimeError(
-        "Neither DATABASE_URL nor PG_DSN is set. "
-        "Copy .env.example to .env and fill in the Postgres DSN."
-    )
-# connectorx requires sslmode in the URI for Render-hosted databases
-_CX_URI = _URI if "sslmode" in _URI else _URI + "?sslmode=require"
 
-
-def _query(sql: str) -> pl.DataFrame:
-    return pl.read_database_uri(sql, _CX_URI)
-
-
-# ── Two-layer TTL cache for dashboard responses ──────────────────────────────
-#
-# Every chart endpoint runs heavy CTE queries against the Render Postgres
-# replica. The dataset updates daily at most, so a long TTL is safe.
-#
-#   L1: in-process dict — sub-microsecond hits, lost on container restart.
-#   L2: SQLite on the vendor-agent Volume — survives rolling deploys and
-#       cold starts so the first user after a deploy doesn't pay full
-#       Postgres latency. Same Volume the job/notification store uses.
-#
-# Read order: L1 → L2 → compute. Writes populate both layers.
-_DASHBOARD_TTL_SECONDS = 3600  # 1 hour — daily-update data, generous
+# Two-layer TTL cache:
+#   L1: in-process dict
+#   L2: SQLite on the vendor-agent Volume
+_DASHBOARD_TTL_SECONDS = 3600
 
 _cache: dict[Any, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
 
 
 def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
-    """Decorator: cache an async endpoint's return value for `ttl` seconds
-    across both an in-process dict (L1) and the SQLite-on-Volume
-    `dashboard_cache` table (L2).
-
-    Cache key includes the function name and resolved arguments (defaults
-    applied), so `?limit=5` and `?limit=10` get separate entries while two
-    requests with the same `limit` share one. Errors are NOT cached —
-    Postgres failures retry on the next request.
-
-    L2 misses (e.g. SQLite/Volume hiccup) downgrade silently to a
-    compute, so a flaky disk never breaks the endpoint.
-    """
     def decorator(fn: Callable) -> Callable:
         sig = inspect.signature(fn)
 
@@ -88,17 +38,19 @@ def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
         async def wrapper(*args, **kwargs):
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
-            key_tuple = (fn.__name__, tuple(sorted(bound.arguments.items())))
+            key_tuple = (
+                local.data_cache_key(),
+                fn.__name__,
+                tuple(sorted(bound.arguments.items())),
+            )
 
             now = time.time()
 
-            # L1
             with _cache_lock:
                 hit = _cache.get(key_tuple)
                 if hit and (now - hit[0]) < ttl:
                     return hit[1]
 
-            # L2 — same TTL as L1; the SQL query already filters expired rows
             key_str = repr(key_tuple)
             try:
                 disk_value = dashboard_cache_get(key_str)
@@ -110,7 +62,6 @@ def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
                     _cache[key_tuple] = (now, disk_value)
                 return disk_value
 
-            # Compute and populate both layers
             result = await fn(*args, **kwargs)
             with _cache_lock:
                 _cache[key_tuple] = (now, result)
@@ -124,427 +75,275 @@ def cached_dashboard(ttl: int = _DASHBOARD_TTL_SECONDS) -> Callable:
     return decorator
 
 
-# Ministry name normalization — maps known variant spellings to a single canonical name.
-# Must be applied in a base CTE before any GROUP BY on ministry.
-_NORM_MINISTRY = r"""
-    CASE
-        WHEN TRIM(ministry) IN (
-            'Children''s Services',
-            'Children and Family Services',
-            'Children & Family Services'
-        ) THEN 'Children''s Services'
-        WHEN TRIM(ministry) IN (
-            'Community and Social Services',
-            'Seniors, Community and Social Services',
-            'Seniors and Community and Social Services'
-        ) THEN 'Seniors, Community and Social Services'
-        ELSE TRIM(ministry)
-    END
-""".strip()
-
-# Recipient name normalization — Receiver General for Canada IS Canada Revenue Agency.
-_NORM_RECIPIENT = r"""
-    CASE
-        WHEN TRIM(recipient) IN (
-            'Receiver General for Canada',
-            'Receiver General of Canada',
-            'Canada Revenue Agency'
-        ) THEN 'Canada Revenue Agency'
-        ELSE TRIM(recipient)
-    END
-""".strip()
-
-
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+def _hhi(vendor_totals: dict[str, float]) -> float:
+    total = sum(vendor_totals.values())
+    if total <= 0:
+        return 0.0
+    return sum((amount / total) ** 2 for amount in vendor_totals.values()) * 10000
+
+
+def _band(hhi: int) -> str:
+    return "HIGH" if hhi > 2500 else "MODERATE" if hhi >= 1500 else "LOW"
+
+
+def _contracts_with_amount() -> tuple[dict[str, Any], ...]:
+    return tuple(r for r in local.ab_contracts() if r.get("amount") is not None)
 
 
 @router.get("/metrics")
 @cached_dashboard()
 async def metrics():
-    df = _query("""
-        SELECT
-            COUNT(*)                    AS total_contracts,
-            SUM(amount)::float8         AS total_spend,
-            COUNT(DISTINCT recipient)   AS unique_vendors
-        FROM ab.ab_contracts
-        WHERE amount IS NOT NULL
-    """)
-    row = df.row(0, named=True)
+    rows = _contracts_with_amount()
     return {
-        "total_contracts": int(row["total_contracts"]),
-        "total_spend":     float(row["total_spend"] or 0),
-        "unique_vendors":  int(row["unique_vendors"]),
+        "total_contracts": len(rows),
+        "total_spend": sum(float(r.get("amount") or 0) for r in rows),
+        "unique_vendors": len({r.get("recipient") for r in rows if r.get("recipient") is not None}),
     }
 
 
 @router.get("/top-vendors")
 @cached_dashboard()
 async def top_vendors(limit: int = 10):
-    df = _query(f"""
-        WITH normed AS (
-            SELECT {_NORM_RECIPIENT} AS recipient, amount
-            FROM ab.ab_contracts
-            WHERE amount IS NOT NULL AND recipient IS NOT NULL
-        )
-        SELECT
-            recipient,
-            COUNT(*)::integer        AS contract_count,
-            SUM(amount)::float8      AS total_amount
-        FROM normed
-        GROUP BY recipient
-        ORDER BY total_amount DESC
-        LIMIT {limit}
-    """)
+    totals: dict[str, dict[str, float | int]] = {}
+    for row in _contracts_with_amount():
+        recipient = local.norm_recipient(row.get("recipient"))
+        if recipient is None:
+            continue
+        entry = totals.setdefault(recipient, {"contract_count": 0, "total_amount": 0.0})
+        entry["contract_count"] = int(entry["contract_count"]) + 1
+        entry["total_amount"] = float(entry["total_amount"]) + float(row.get("amount") or 0)
+
+    ranked = sorted(totals.items(), key=lambda item: float(item[1]["total_amount"]), reverse=True)
     return [
         {
-            "recipient":      str(row["recipient"]),
-            "contract_count": int(row["contract_count"]),
-            "total_amount":   float(row["total_amount"] or 0),
+            "recipient": recipient,
+            "contract_count": int(values["contract_count"]),
+            "total_amount": float(values["total_amount"]),
         }
-        for row in df.to_dicts()
+        for recipient, values in ranked[:limit]
     ]
+
+
+def _department_vendor_totals() -> dict[str, dict[str, float]]:
+    grouped: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for row in _contracts_with_amount():
+        ministry = local.norm_ministry(row.get("ministry"))
+        recipient = local.norm_recipient(row.get("recipient"))
+        if ministry is None or recipient is None:
+            continue
+        grouped[ministry][recipient] += float(row.get("amount") or 0)
+    return {dept: dict(vendors) for dept, vendors in grouped.items()}
 
 
 @router.get("/concentration")
 @cached_dashboard()
 async def concentration(limit: int = 5):
     try:
-        df = _query(f"""
-            WITH normed AS (
-                SELECT {_NORM_MINISTRY} AS ministry, {_NORM_RECIPIENT} AS recipient, amount
-                FROM ab.ab_contracts
-                WHERE amount IS NOT NULL AND recipient IS NOT NULL AND ministry IS NOT NULL
-            ),
-            vendor_totals AS (
-                SELECT ministry AS grp, recipient AS vendor,
-                       SUM(amount)::float8 AS vendor_total
-                FROM normed
-                GROUP BY ministry, recipient
-            ),
-            group_totals AS (
-                SELECT grp, SUM(vendor_total)::float8 AS group_total
-                FROM vendor_totals
-                GROUP BY grp
-            ),
-            hhi_calc AS (
-                SELECT vt.grp,
-                       SUM(POWER(vt.vendor_total / gt.group_total, 2))::float8 AS hhi_raw
-                FROM vendor_totals vt
-                JOIN group_totals gt ON vt.grp = gt.grp
-                GROUP BY vt.grp
-            )
-            SELECT gt.grp AS department, (hc.hhi_raw * 10000)::float8 AS hhi_float
-            FROM group_totals gt
-            JOIN hhi_calc hc ON gt.grp = hc.grp
-            ORDER BY hhi_float DESC
-            LIMIT {limit}
-        """)
+        rows = []
+        for department, vendor_totals in _department_vendor_totals().items():
+            hhi = int(_hhi(vendor_totals))
+            rows.append({"department": department, "hhi": hhi, "band": _band(hhi)})
+        rows.sort(key=lambda r: r["hhi"], reverse=True)
+        return rows[:limit]
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    result = []
-    for row in df.to_dicts():
-        hhi = int(float(row["hhi_float"]))
-        result.append({
-            "department": str(row["department"]),
-            "hhi":        hhi,
-            "band":       "HIGH" if hhi > 2500 else "MODERATE" if hhi >= 1500 else "LOW",
-        })
-    return result
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/concentration-scatter")
 @cached_dashboard()
 async def concentration_scatter():
     try:
-        df = _query(f"""
-            WITH normed AS (
-                SELECT {_NORM_MINISTRY} AS ministry, {_NORM_RECIPIENT} AS recipient, amount
-                FROM ab.ab_contracts
-                WHERE amount IS NOT NULL AND recipient IS NOT NULL AND ministry IS NOT NULL
-            ),
-            vendor_totals AS (
-                SELECT ministry AS grp, recipient AS vendor,
-                       SUM(amount)::float8 AS vendor_total
-                FROM normed
-                GROUP BY ministry, recipient
-            ),
-            group_totals AS (
-                SELECT grp,
-                       SUM(vendor_total)::float8  AS group_total,
-                       COUNT(DISTINCT vendor)::integer AS vendor_count
-                FROM vendor_totals
-                GROUP BY grp
-            ),
-            hhi_calc AS (
-                SELECT vt.grp,
-                       SUM(POWER(vt.vendor_total / gt.group_total, 2))::float8 AS hhi_raw
-                FROM vendor_totals vt
-                JOIN group_totals gt ON vt.grp = gt.grp
-                GROUP BY vt.grp
-            )
-            SELECT
-                gt.grp                          AS department,
-                (hc.hhi_raw * 10000)::float8    AS hhi_float,
-                gt.group_total                  AS total_spend,
-                gt.vendor_count
-            FROM group_totals gt
-            JOIN hhi_calc hc ON gt.grp = hc.grp
-            ORDER BY gt.group_total DESC
-        """)
+        rows = []
+        for department, vendor_totals in _department_vendor_totals().items():
+            hhi = int(_hhi(vendor_totals))
+            rows.append({
+                "department": department,
+                "hhi": hhi,
+                "band": _band(hhi),
+                "total_spend": sum(vendor_totals.values()),
+                "vendor_count": len(vendor_totals),
+            })
+        rows.sort(key=lambda r: r["total_spend"], reverse=True)
+        return rows
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    result = []
-    for row in df.to_dicts():
-        hhi = int(float(row["hhi_float"]))
-        result.append({
-            "department":   str(row["department"]),
-            "hhi":          hhi,
-            "band":         "HIGH" if hhi > 2500 else "MODERATE" if hhi >= 1500 else "LOW",
-            "total_spend":  float(row["total_spend"] or 0),
-            "vendor_count": int(row["vendor_count"] or 0),
-        })
-    return result
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/vendor-dominance")
 @cached_dashboard()
 async def vendor_dominance(limit: int = 12):
     try:
-        df = _query(f"""
-            WITH normed AS (
-                SELECT {_NORM_MINISTRY} AS ministry, {_NORM_RECIPIENT} AS recipient, amount
-                FROM ab.ab_contracts
-                WHERE amount IS NOT NULL AND ministry IS NOT NULL
-            ),
-            ministry_totals AS (
-                SELECT ministry,
-                       SUM(amount)::float8 AS total_spend
-                FROM normed
-                GROUP BY ministry
-                ORDER BY total_spend DESC
-                LIMIT {limit}
-            ),
-            vendor_spend AS (
-                SELECT n.ministry, n.recipient,
-                       SUM(n.amount)::float8 AS vendor_total
-                FROM normed n
-                JOIN ministry_totals mt ON n.ministry = mt.ministry
-                WHERE n.recipient IS NOT NULL
-                GROUP BY n.ministry, n.recipient
-            ),
-            ranked AS (
-                SELECT ministry, recipient,
-                       vendor_total,
-                       ROW_NUMBER() OVER (PARTITION BY ministry ORDER BY vendor_total DESC) AS rn
-                FROM vendor_spend
-            )
-            SELECT
-                mt.ministry     AS department,
-                mt.total_spend,
-                r.recipient     AS top_vendor,
-                r.vendor_total  AS vendor_spend,
-                (r.vendor_total / mt.total_spend * 100)::float8 AS dominance_pct
-            FROM ministry_totals mt
-            JOIN ranked r ON mt.ministry = r.ministry AND r.rn = 1
-            ORDER BY mt.total_spend DESC
-        """)
+        department_totals: dict[str, float] = defaultdict(float)
+        vendor_totals: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+        for row in _contracts_with_amount():
+            ministry = local.norm_ministry(row.get("ministry"))
+            if ministry is None:
+                continue
+            amount = float(row.get("amount") or 0)
+            department_totals[ministry] += amount
+            recipient = local.norm_recipient(row.get("recipient"))
+            if recipient is not None:
+                vendor_totals[ministry][recipient] += amount
+
+        top_departments = sorted(department_totals.items(), key=lambda item: item[1], reverse=True)[:limit]
+        result = []
+        for department, total_spend in top_departments:
+            vendors = vendor_totals.get(department) or {}
+            if not vendors:
+                continue
+            top_vendor, vendor_spend = max(vendors.items(), key=lambda item: item[1])
+            result.append({
+                "department": department,
+                "total_spend": total_spend,
+                "top_vendor": top_vendor,
+                "vendor_spend": vendor_spend,
+                "dominance_pct": (vendor_spend / total_spend * 100) if total_spend else 0.0,
+            })
+        return result
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [
-        {
-            "department":    str(r["department"]),
-            "total_spend":   float(r["total_spend"] or 0),
-            "top_vendor":    str(r["top_vendor"]),
-            "vendor_spend":  float(r["vendor_spend"] or 0),
-            "dominance_pct": float(r["dominance_pct"] or 0),
-        }
-        for r in df.to_dicts()
-    ]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/spend-by-year")
 @cached_dashboard()
 async def spend_by_year():
     try:
-        df = _query("""
-            SELECT
-                LEFT(display_fiscal_year, 4)::integer AS year,
-                SUM(amount)::float8                   AS total_spend
-            FROM ab.ab_contracts
-            WHERE display_fiscal_year IS NOT NULL
-              AND amount IS NOT NULL
-            GROUP BY LEFT(display_fiscal_year, 4)
-            ORDER BY year ASC
-        """)
+        totals: dict[int, float] = defaultdict(float)
+        for row in _contracts_with_amount():
+            year = local.fiscal_year_start(row.get("display_fiscal_year"))
+            if year is not None:
+                totals[year] += float(row.get("amount") or 0)
+        return [
+            {"year": year, "total_spend": amount}
+            for year, amount in sorted(totals.items())
+        ]
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [
-        {"year": int(row["year"]), "total_spend": float(row["total_spend"] or 0)}
-        for row in df.to_dicts()
-    ]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/concentration-trend")
 @cached_dashboard()
 async def concentration_trend():
     try:
-        df = _query(f"""
-            WITH normed AS (
-                SELECT {_NORM_MINISTRY} AS ministry, {_NORM_RECIPIENT} AS recipient, amount, display_fiscal_year
-                FROM ab.ab_contracts
-                WHERE amount IS NOT NULL AND ministry IS NOT NULL
-            ),
-            vendor_totals AS (
-                SELECT ministry, recipient, SUM(amount)::float8 AS vendor_total
-                FROM normed
-                WHERE recipient IS NOT NULL
-                GROUP BY ministry, recipient
-            ),
-            group_totals AS (
-                SELECT ministry, SUM(vendor_total)::float8 AS group_total
-                FROM vendor_totals GROUP BY ministry
-            ),
-            overall_hhi AS (
-                SELECT vt.ministry,
-                       (SUM(POWER(vt.vendor_total / gt.group_total, 2)) * 10000)::float8 AS hhi
-                FROM vendor_totals vt
-                JOIN group_totals gt ON vt.ministry = gt.ministry
-                GROUP BY vt.ministry
-            ),
-            top_depts AS (
-                SELECT ministry FROM overall_hhi ORDER BY hhi DESC LIMIT 5
-            ),
-            yearly_vendor_totals AS (
-                SELECT
-                    n.ministry,
-                    n.recipient,
-                    LEFT(n.display_fiscal_year, 4)::integer AS year,
-                    SUM(n.amount)::float8 AS vendor_total
-                FROM normed n
-                JOIN top_depts td ON n.ministry = td.ministry
-                WHERE n.recipient IS NOT NULL AND n.display_fiscal_year IS NOT NULL
-                GROUP BY n.ministry, n.recipient, LEFT(n.display_fiscal_year, 4)::integer
-            ),
-            yearly_group_totals AS (
-                SELECT ministry, year, SUM(vendor_total)::float8 AS group_total
-                FROM yearly_vendor_totals GROUP BY ministry, year
-            )
-            SELECT
-                yvt.year,
-                yvt.ministry AS department,
-                ROUND(SUM(POWER(yvt.vendor_total / ygt.group_total, 2)) * 10000)::integer AS hhi
-            FROM yearly_vendor_totals yvt
-            JOIN yearly_group_totals ygt
-              ON yvt.ministry = ygt.ministry AND yvt.year = ygt.year
-            GROUP BY yvt.year, yvt.ministry
-            ORDER BY yvt.year ASC, yvt.ministry ASC
-        """)
+        overall = _department_vendor_totals()
+        top_depts = {
+            dept
+            for dept, _ in sorted(
+                ((dept, _hhi(vendors)) for dept, vendors in overall.items()),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
+        }
+
+        yearly_vendor_totals: dict[tuple[int, str], dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for row in _contracts_with_amount():
+            ministry = local.norm_ministry(row.get("ministry"))
+            if ministry not in top_depts:
+                continue
+            recipient = local.norm_recipient(row.get("recipient"))
+            year = local.fiscal_year_start(row.get("display_fiscal_year"))
+            if recipient is None or year is None:
+                continue
+            yearly_vendor_totals[(year, ministry)][recipient] += float(row.get("amount") or 0)
+
+        rows = [
+            {"year": year, "department": department, "hhi": int(round(_hhi(vendors)))}
+            for (year, department), vendors in yearly_vendor_totals.items()
+        ]
+        rows.sort(key=lambda r: (r["year"], r["department"]))
+        return rows
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [
-        {"year": int(r["year"]), "department": str(r["department"]), "hhi": int(r["hhi"])}
-        for r in df.to_dicts()
-    ]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/vendor-competition")
 @cached_dashboard()
 async def vendor_competition():
     try:
-        df = _query(f"""
-            WITH normed AS (
-                SELECT {_NORM_RECIPIENT} AS recipient, amount, display_fiscal_year
-                FROM ab.ab_contracts
-                WHERE amount IS NOT NULL AND recipient IS NOT NULL AND display_fiscal_year IS NOT NULL
-            ),
-            first_year AS (
-                SELECT
-                    recipient,
-                    MIN(LEFT(display_fiscal_year, 4)::integer) AS first_year
-                FROM normed
-                GROUP BY recipient
-            ),
-            yearly_spend AS (
-                SELECT
-                    LEFT(n.display_fiscal_year, 4)::integer AS year,
-                    n.recipient,
-                    SUM(n.amount)::float8 AS spend
-                FROM normed n
-                GROUP BY LEFT(n.display_fiscal_year, 4)::integer, n.recipient
-            )
-            SELECT
-                y.year,
-                COALESCE(SUM(CASE WHEN fy.first_year = y.year THEN y.spend END), 0)::float8
-                    AS new_spend,
-                COALESCE(SUM(CASE WHEN fy.first_year < y.year THEN y.spend END), 0)::float8
-                    AS returning_spend,
-                COUNT(DISTINCT CASE WHEN fy.first_year = y.year THEN y.recipient END)::integer
-                    AS new_count,
-                COUNT(DISTINCT CASE WHEN fy.first_year < y.year THEN y.recipient END)::integer
-                    AS returning_count
-            FROM yearly_spend y
-            JOIN first_year fy ON y.recipient = fy.recipient
-            GROUP BY y.year
-            ORDER BY y.year ASC
-        """)
+        first_year: dict[str, int] = {}
+        yearly_spend: dict[tuple[int, str], float] = defaultdict(float)
+
+        for row in _contracts_with_amount():
+            recipient = local.norm_recipient(row.get("recipient"))
+            year = local.fiscal_year_start(row.get("display_fiscal_year"))
+            if recipient is None or year is None:
+                continue
+            first_year[recipient] = min(first_year.get(recipient, year), year)
+            yearly_spend[(year, recipient)] += float(row.get("amount") or 0)
+
+        by_year: dict[int, dict[str, float | set[str]]] = defaultdict(
+            lambda: {
+                "new_spend": 0.0,
+                "returning_spend": 0.0,
+                "new_recipients": set(),
+                "returning_recipients": set(),
+            }
+        )
+        for (year, recipient), spend in yearly_spend.items():
+            bucket = by_year[year]
+            if first_year.get(recipient) == year:
+                bucket["new_spend"] = float(bucket["new_spend"]) + spend
+                bucket["new_recipients"].add(recipient)  # type: ignore[union-attr]
+            elif first_year.get(recipient, year) < year:
+                bucket["returning_spend"] = float(bucket["returning_spend"]) + spend
+                bucket["returning_recipients"].add(recipient)  # type: ignore[union-attr]
+
+        return [
+            {
+                "year": year,
+                "new_spend": float(values["new_spend"]),
+                "returning_spend": float(values["returning_spend"]),
+                "new_count": len(values["new_recipients"]),  # type: ignore[arg-type]
+                "returning_count": len(values["returning_recipients"]),  # type: ignore[arg-type]
+            }
+            for year, values in sorted(by_year.items())
+        ]
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [
-        {
-            "year": int(r["year"]),
-            "new_spend":        float(r["new_spend"] or 0),
-            "returning_spend":  float(r["returning_spend"] or 0),
-            "new_count":        int(r["new_count"] or 0),
-            "returning_count":  int(r["returning_count"] or 0),
-        }
-        for r in df.to_dicts()
-    ]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _bucket(amount: float) -> tuple[int, str]:
+    if amount < 10_000:
+        return 1, "<$10K"
+    if amount < 25_000:
+        return 2, "$10-25K"
+    if amount < 50_000:
+        return 3, "$25-50K"
+    if amount < 75_000:
+        return 4, "$50-75K"
+    if amount < 100_000:
+        return 5, "$75-100K"
+    if amount < 250_000:
+        return 6, "$100-250K"
+    if amount < 500_000:
+        return 7, "$250-500K"
+    if amount < 1_000_000:
+        return 8, "$500K-1M"
+    return 9, "$1M+"
 
 
 @router.get("/contract-distribution")
 @cached_dashboard()
 async def contract_distribution():
     try:
-        df = _query("""
-            SELECT
-                CASE
-                    WHEN amount < 10000   THEN 1
-                    WHEN amount < 25000   THEN 2
-                    WHEN amount < 50000   THEN 3
-                    WHEN amount < 75000   THEN 4
-                    WHEN amount < 100000  THEN 5
-                    WHEN amount < 250000  THEN 6
-                    WHEN amount < 500000  THEN 7
-                    WHEN amount < 1000000 THEN 8
-                    ELSE 9
-                END AS bucket_id,
-                CASE
-                    WHEN amount < 10000   THEN '<$10K'
-                    WHEN amount < 25000   THEN '$10–25K'
-                    WHEN amount < 50000   THEN '$25–50K'
-                    WHEN amount < 75000   THEN '$50–75K'
-                    WHEN amount < 100000  THEN '$75–100K'
-                    WHEN amount < 250000  THEN '$100–250K'
-                    WHEN amount < 500000  THEN '$250–500K'
-                    WHEN amount < 1000000 THEN '$500K–1M'
-                    ELSE '$1M+'
-                END AS bucket,
-                COUNT(*)::integer       AS contract_count,
-                SUM(amount)::float8     AS total_amount
-            FROM ab.ab_contracts
-            WHERE amount > 0 AND amount IS NOT NULL
-            GROUP BY bucket_id, bucket
-            ORDER BY bucket_id
-        """)
+        totals: dict[int, dict[str, Any]] = {}
+        for row in _contracts_with_amount():
+            amount = row.get("amount")
+            if amount is None or amount <= 0:
+                continue
+            bucket_id, label = _bucket(float(amount))
+            entry = totals.setdefault(bucket_id, {
+                "bucket_id": bucket_id,
+                "bucket": label,
+                "contract_count": 0,
+                "total_amount": 0.0,
+            })
+            entry["contract_count"] += 1
+            entry["total_amount"] += float(amount)
+        return [totals[bucket_id] for bucket_id in sorted(totals)]
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    return [
-        {
-            "bucket_id":      int(r["bucket_id"]),
-            "bucket":         str(r["bucket"]),
-            "contract_count": int(r["contract_count"]),
-            "total_amount":   float(r["total_amount"] or 0),
-        }
-        for r in df.to_dicts()
-    ]
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

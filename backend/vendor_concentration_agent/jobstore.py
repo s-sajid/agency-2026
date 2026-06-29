@@ -338,7 +338,7 @@ def sweep_expired_jobs() -> int:
 # The dashboards layer keeps an in-process dict for sub-microsecond hits.
 # This SQLite-backed layer survives restarts and rolling deploys, so the
 # first user after a deploy gets warm responses instead of paying the
-# full Postgres CTE latency. The dashboards decorator uses both layers.
+# local aggregation cost. The dashboards decorator uses both layers.
 
 def dashboard_cache_get(key: str) -> Any | None:
     """Return the JSON-decoded cached value for `key` if its expiry is

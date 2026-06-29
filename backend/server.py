@@ -7,7 +7,7 @@ deployment. Hosted on Modal (or any Python host) on the `deploy` branch.
                                 notifications dossier modal)
   GET  /audit/{call_id}       → math-tool audit blob
   GET  /notifications         → list of high-HHI scan results
-  GET  /dashboard/*           → read-only Postgres dashboards
+  GET  /dashboard/*           → local JSONL-backed dashboards
   GET  /health                → liveness probe
 
 The orchestrator + 4 specialist agents run in-process via
@@ -51,7 +51,7 @@ async def _prewarm_dashboards() -> None:
     is hot before the first user request lands. After a fresh container
     boot the L2 disk cache fills the L1 dict on first hit (cheap); on
     a truly cold boot (empty Volume / first-ever deploy) this pays the
-    full Postgres latency once per endpoint, but keeps users out of
+    local aggregation cost once per endpoint, but keeps users out of
     that path entirely.
 
     Per-endpoint failures are logged and ignored so one flaky chart

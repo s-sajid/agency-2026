@@ -20,3 +20,7 @@ terraform/*.tfstate*
 .env.local
 docs
 references/excerpts
+
+# Keep Docker builds from sending the full local dataset context.
+# The backend image copies the small subset from backend/data instead.
+april-26-hackathon-dataset/**

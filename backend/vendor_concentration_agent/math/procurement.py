@@ -4,7 +4,7 @@ footprint, competition count.
 
 from __future__ import annotations
 
-from vendor_concentration_agent.data.postgres import query
+from vendor_concentration_agent.data import local
 from vendor_concentration_agent.data.datasets import get as _get_dataset
 from vendor_concentration_agent.math.types import MathResult
 
@@ -43,8 +43,20 @@ def sole_source_rate(
         FROM ab.ab_contracts
         WHERE {where_sql}
     """
-    rows = query(sql, params)
-    by_source = {r["source"]: float(r["total"]) for r in rows}
+    def _matches(row: dict) -> bool:
+        amount = row.get("amount")
+        if amount is None or amount <= 0:
+            return False
+        if ministry is not None and row.get("ministry") != ministry:
+            return False
+        if fiscal_year is not None and row.get("display_fiscal_year") != fiscal_year:
+            return False
+        return True
+
+    by_source = {
+        "sole_source": sum(float(r.get("amount") or 0) for r in local.ab_sole_source() if _matches(r)),
+        "contracts": sum(float(r.get("amount") or 0) for r in local.ab_contracts() if _matches(r)),
+    }
     sole = by_source.get("sole_source", 0.0)
     comp = by_source.get("contracts", 0.0)
     total = sole + comp
@@ -89,7 +101,16 @@ def incumbency_streak(dataset: str, vendor: str, category: str) -> MathResult:
           AND {ds.fiscal_year_col} IS NOT NULL
         ORDER BY fy
     """
-    rows = query(sql, {"vendor": vendor, "cat": category})
+    seen_years = {
+        row.get(ds.fiscal_year_col)
+        for row in local.rows_for_dataset(dataset)
+        if row.get(ds.vendor_col) == vendor
+        and row.get(ds.category_col) == category
+        and row.get(ds.amount_col) is not None
+        and row.get(ds.amount_col) > 0
+        and row.get(ds.fiscal_year_col) is not None
+    }
+    rows = [{"fy": fy} for fy in sorted(seen_years)]
     years = [r["fy"] for r in rows]
 
     # Convert each fiscal year to its first 4-digit number so we can detect
@@ -173,8 +194,40 @@ def vendor_footprint(vendor: str) -> MathResult:
           ARRAY_AGG(DISTINCT ministry ORDER BY ministry) AS ministries
         FROM all_rows
     """
-    rows = query(sql, {"vendor": vendor})
-    r = rows[0] if rows else {}
+    all_rows: list[dict] = []
+    for row in local.ab_sole_source():
+        if row.get("vendor") == vendor and row.get("amount") is not None and row.get("amount") > 0:
+            all_rows.append({
+                "vendor": row.get("vendor"),
+                "ministry": row.get("ministry"),
+                "category": row.get("contract_services"),
+                "amount": row.get("amount"),
+                "display_fiscal_year": row.get("display_fiscal_year"),
+                "source": "sole_source",
+            })
+    for row in local.ab_contracts():
+        if row.get("recipient") == vendor and row.get("amount") is not None and row.get("amount") > 0:
+            all_rows.append({
+                "vendor": row.get("recipient"),
+                "ministry": row.get("ministry"),
+                "category": None,
+                "amount": row.get("amount"),
+                "display_fiscal_year": row.get("display_fiscal_year"),
+                "source": "contracts",
+            })
+
+    years = [r.get("display_fiscal_year") for r in all_rows if r.get("display_fiscal_year") is not None]
+    ministries = sorted({r.get("ministry") for r in all_rows if r.get("ministry") is not None})
+    categories = {r.get("category") for r in all_rows if r.get("category") is not None}
+    r = {
+        "contract_count": len(all_rows),
+        "total_amount": sum(float(row.get("amount") or 0) for row in all_rows),
+        "ministry_count": len(ministries),
+        "category_count": len(categories),
+        "first_year": min(years) if years else None,
+        "last_year": max(years) if years else None,
+        "ministries": ministries,
+    }
     contract_count = int(r.get("contract_count") or 0)
     total = float(r.get("total_amount") or 0)
     ministries = list(r.get("ministries") or [])
@@ -223,8 +276,19 @@ def competition_count(dataset: str, category: str) -> MathResult:
           AND {ds.amount_col} IS NOT NULL
           AND {ds.amount_col} > 0
     """
-    rows = query(sql, {"cat": category})
-    r = rows[0] if rows else {}
+    matching = [
+        row
+        for row in local.rows_for_dataset(dataset)
+        if row.get(ds.category_col) == category
+        and row.get(ds.amount_col) is not None
+        and row.get(ds.amount_col) > 0
+    ]
+    vendors = {row.get(ds.vendor_col) for row in matching if row.get(ds.vendor_col) is not None}
+    r = {
+        "n_vendors": len(vendors),
+        "n_contracts": len(matching),
+        "total_amount": sum(float(row.get(ds.amount_col) or 0) for row in matching),
+    }
     n_vendors = int(r.get("n_vendors") or 0)
 
     return MathResult(

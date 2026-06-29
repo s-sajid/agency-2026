@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from vendor_concentration_agent.data.postgres import query
+from vendor_concentration_agent.data import local
 from vendor_concentration_agent.math.types import MathResult
 
 
@@ -32,7 +32,15 @@ def cross_dataset_lookup(vendor_name: str) -> MathResult:
         LIMIT 1
     """
     pattern = f"%{vendor_name}%"
-    rows = query(sql, {"p": pattern})
+    match = local.find_entity_record(vendor_name)
+    rows = []
+    if match is not None:
+        rows.append({
+            **match,
+            "has_cra": match.get("cra_profile") is not None,
+            "has_fed": match.get("fed_profile") is not None,
+            "has_ab": match.get("ab_profile") is not None,
+        })
 
     if not rows:
         return MathResult(
@@ -40,7 +48,7 @@ def cross_dataset_lookup(vendor_name: str) -> MathResult:
             formula_id="cross_dataset_lookup",
             sql=sql.strip(),
             source_rows=[],
-            trace_steps=[{"step": "match", "value": "no entity_golden_records hit"}],
+            trace_steps=[{"step": "match", "value": "no local entity_golden_records hit"}],
             references=[],
             inputs={"vendor_name": vendor_name},
         )

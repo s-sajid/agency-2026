@@ -20,6 +20,10 @@ out/
 data/duckdb_cache/
 data/*.parquet
 
+# Full local hackathon dataset. The small deployable subset lives in
+# backend/data and is intentionally trackable.
+april-26-hackathon-dataset/**
+
 # IDE / OS
 .vscode/
 .idea/

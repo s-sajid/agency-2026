@@ -2,63 +2,78 @@ import { streamChatEvents, fetchSpendByYear } from '@/lib/api'
 
 global.fetch = jest.fn()
 
-function mockSequence(...responses: Array<Partial<Response> | { ok: boolean; json: () => Promise<unknown>; text?: () => Promise<string> }>) {
-  const mock = fetch as jest.Mock
-  for (const r of responses) mock.mockResolvedValueOnce(r as Response)
+class MockEventSource {
+  static instances: MockEventSource[] = []
+
+  onmessage: ((event: { data: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  closed = false
+
+  constructor(public url: string) {
+    MockEventSource.instances.push(this)
+  }
+
+  emit(data: unknown) {
+    this.onmessage?.({ data: JSON.stringify(data) })
+  }
+
+  close() {
+    this.closed = true
+  }
 }
 
-describe('streamChatEvents (polling)', () => {
+global.EventSource = MockEventSource as unknown as typeof EventSource
+
+async function waitForEventSource(): Promise<MockEventSource> {
+  for (let i = 0; i < 10; i++) {
+    const source = MockEventSource.instances.at(-1)
+    if (source) return source
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  throw new Error('EventSource was not created')
+}
+
+describe('streamChatEvents (SSE)', () => {
   beforeEach(() => {
     ;(fetch as jest.Mock).mockReset()
+    MockEventSource.instances = []
   })
 
-  it('yields events from the first poll and stops at status=complete', async () => {
-    mockSequence(
-      { ok: true, json: async () => ({ job_id: 'j1' }) },
-      {
-        ok: true,
-        json: async () => ({
-          job_id: 'j1',
-          status: 'complete',
-          events: [
-            { kind: 'tool', payload: { tool: 'router', label: 'Router', question: 'hi' } },
-            { kind: 'tool_done', payload: { tool_done: 'router' } },
-            { kind: 'text', payload: { text: 'hello world' } },
-          ],
-          active_agent: null,
-          result: null,
-        }),
-      },
-    )
-
+  it('yields events from the SSE stream and stops at status=complete', async () => {
+    ;(fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 'j1' }) })
     const events: unknown[] = []
-    for await (const ev of streamChatEvents('test')) events.push(ev)
+    const consume = (async () => {
+      for await (const ev of streamChatEvents('test')) events.push(ev)
+    })()
+
+    const source = await waitForEventSource()
+    expect(source.url).toBe('/chat/stream/j1')
+    source.emit({ kind: 'tool', payload: { tool: 'router', label: 'Router', question: 'hi' } })
+    source.emit({ kind: 'tool_done', payload: { tool_done: 'router' } })
+    source.emit({ kind: 'text', payload: { text: 'hello world' } })
+    source.emit({ kind: 'status', payload: { status: 'complete' } })
+    await consume
 
     expect(events).toEqual([
       { type: 'tool', name: 'router', label: 'Router', question: 'hi' },
       { type: 'tool_done', name: 'router' },
       { type: 'text', text: 'hello world' },
     ])
+    expect(source.closed).toBe(true)
   })
 
   it('throws when an error event appears in the stream', async () => {
-    mockSequence(
-      { ok: true, json: async () => ({ job_id: 'j2' }) },
-      {
-        ok: true,
-        json: async () => ({
-          job_id: 'j2',
-          status: 'error',
-          events: [{ kind: 'error', payload: { error: 'backend exploded' } }],
-          active_agent: null,
-          result: null,
-        }),
-      },
-    )
+    ;(fetch as jest.Mock).mockResolvedValueOnce({ ok: true, json: async () => ({ job_id: 'j2' }) })
 
-    await expect(async () => {
+    const consume = async () => {
       for await (const _ of streamChatEvents('bad')) { /* consume */ }
-    }).rejects.toThrow('backend exploded')
+    }
+    const pending = consume()
+    const source = await waitForEventSource()
+    source.emit({ kind: 'error', payload: { error: 'backend exploded' } })
+
+    await expect(pending).rejects.toThrow('backend exploded')
+    expect(source.closed).toBe(true)
   })
 })
 
