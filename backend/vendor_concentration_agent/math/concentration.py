@@ -1,14 +1,8 @@
-"""Market concentration formulas — HHI, CR_n, Gini, plus a discovery
-helper that ranks every category in a dataset by single-vendor share.
-
-All values are computed in SQL on the source-of-truth Postgres tables.
-Each function returns a MathResult with the SQL, source rows, per-term
-arithmetic trace, and references to the published methodology.
-"""
+"""Market concentration formulas backed by the local April JSONL dataset."""
 
 from __future__ import annotations
 
-from vendor_concentration_agent.data.postgres import query
+from vendor_concentration_agent.data import local
 from vendor_concentration_agent.data.datasets import get as _get_dataset
 from vendor_concentration_agent.math.types import MathResult
 
@@ -31,7 +25,7 @@ def _vendor_amounts(dataset: str, category: str) -> tuple[str, list[dict]]:
         GROUP BY {ds.vendor_col}
         ORDER BY vendor_amt DESC
     """
-    rows = query(sql, {"cat": category})
+    rows = local.vendor_amounts(dataset, category)
     return sql.strip(), rows
 
 
@@ -211,7 +205,7 @@ def top_concentrated_categories(
         ORDER BY top1_share_pct DESC, cat_total DESC
         LIMIT %(limit)s
     """
-    rows = query(sql, {"min_total": min_total, "limit": limit})
+    rows = local.top_concentrated_rows(dataset, min_total=min_total, limit=limit)
 
     return MathResult(
         value=[
@@ -226,7 +220,7 @@ def top_concentrated_categories(
         ],
         formula_id="top_concentrated_categories",
         sql=sql.strip(),
-        source_rows=[{k: (float(v) if str(type(v).__name__) == "Decimal" else v) for k, v in r.items()} for r in rows],
+        source_rows=rows,
         trace_steps=[],
         references=[],
         inputs={"dataset": dataset, "min_total": min_total, "limit": limit},

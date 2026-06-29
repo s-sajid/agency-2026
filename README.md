@@ -9,6 +9,18 @@ Postgres for the procurement data.
 > + SQS + DynamoDB + Lambda + Bedrock + Terraform topology shipped on
 > the `main` branch, with the same agent design as below.
 
+## Post-Event Maintenance
+
+After the event, the external Postgres-backed data source used by the
+demo was retired. The deploy branch now packages the small Alberta JSONL
+subset needed for the live demo under `backend/data/` and reads it
+locally. The original architecture notes below are retained to document
+what was built during the hackathon.
+
+No new environment variables are required for this maintenance path.
+Existing deployed secrets such as `PG_DSN` can remain configured; the
+local JSONL path is selected by the backend code.
+
 ## Technology stack
 
 | Layer | Technology | Where it lives |

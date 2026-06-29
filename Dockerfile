@@ -34,11 +34,15 @@ COPY backend/vendor_concentration_agent ./vendor_concentration_agent
 # References registry lives at repo root
 COPY references ./references
 
+# Local demo dataset subset.
+COPY backend/data ./data
+
 # Layer 3 — Next.js static export
 COPY --from=frontend-build /app/out ./static
 
 ENV PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    LOCAL_DATA_DIR=/app/data
 
 EXPOSE 8000
 

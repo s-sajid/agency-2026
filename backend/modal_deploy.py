@@ -8,7 +8,7 @@ Deploy:
     cd backend && uv run modal deploy modal_deploy.py
 
 The Modal CLI reads MODAL_TOKEN_ID / MODAL_TOKEN_SECRET from env. All
-other secrets (OLLAMA_CLOUD_API_KEY, PG_DSN, CORS_ORIGINS, etc.) come
+other secrets (OLLAMA_CLOUD_API_KEY, CORS_ORIGINS, etc.) come
 from a Modal Secret named `vendor-agent` — create with:
 
     modal secret create vendor-agent \\
@@ -16,7 +16,6 @@ from a Modal Secret named `vendor-agent` — create with:
         OLLAMA_HOST=https://ollama.com \\
         LLM_PROVIDER=ollama \\
         LLM_MODEL=gemma4:31b-cloud \\
-        PG_DSN=... \\
         CORS_ORIGINS=https://your-app.vercel.app
 """
 
@@ -36,6 +35,7 @@ image = (
         "vendor_concentration_agent",
         remote_path="/root/vendor_concentration_agent",
     )
+    .add_local_dir("data", remote_path="/root/data")
     .add_local_file("server.py", "/root/server.py")
 )
 
@@ -61,6 +61,7 @@ app = modal.App(
 def web():
     import os
     os.environ.setdefault("JOBSTORE_DB", "/data/vendor_agent.db")
+    os.environ.setdefault("LOCAL_DATA_DIR", "/root/data")
     from server import app as fastapi_app
     return fastapi_app
 
@@ -79,6 +80,7 @@ async def scheduled_scan():
     import uuid
 
     os.environ.setdefault("JOBSTORE_DB", "/data/vendor_agent.db")
+    os.environ.setdefault("LOCAL_DATA_DIR", "/root/data")
     from vendor_concentration_agent.jobstore import SqliteJobSink
     from vendor_concentration_agent.orchestration import run_job
 
